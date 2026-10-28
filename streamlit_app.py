@@ -45,11 +45,45 @@ def num(info, chave):
 
 
 # -------------------------------------------------------------------- dados
-def normalizar_ticker(texto, mercado):
-    t = texto.strip().upper()
-    if mercado == "Brasil (B3)" and t and not t.endswith(".SA"):
-        t += ".SA"
-    return t
+TIPOS_OK = {"EQUITY": "Ação", "ETF": "ETF/FII", "CRYPTOCURRENCY": "Cripto", "INDEX": "Índice"}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def buscar_ativos(consulta):
+    """Procura por nome ou código (ações, FIIs/ETFs, criptomoedas)."""
+    consulta = consulta.strip()
+    if not consulta:
+        return []
+    resultados = []
+    try:
+        quotes = yf.Search(consulta, max_results=10, news_count=0).quotes
+    except Exception:
+        quotes = []
+    for q in quotes:
+        simbolo, tipo = q.get("symbol"), q.get("quoteType")
+        if not simbolo or tipo not in TIPOS_OK:
+            continue
+        nome = q.get("longname") or q.get("shortname") or simbolo
+        bolsa = q.get("exchDisp") or q.get("exchange") or ""
+        resultados.append({
+            "simbolo": simbolo, "tipo": tipo,
+            "rotulo": f"{nome} ({simbolo}) · {TIPOS_OK[tipo]} · {bolsa}"})
+    if resultados:
+        return resultados
+
+    # Plano B: tenta o texto como código (direto, B3 ou cripto)
+    base = consulta.upper().replace(" ", "")
+    for cand in (base, base + ".SA", base + "-USD"):
+        try:
+            h = yf.Ticker(cand).history(period="5d")
+        except Exception:
+            continue
+        if not h.empty:
+            tipo = "CRYPTOCURRENCY" if cand.endswith("-USD") else "EQUITY"
+            resultados.append({"simbolo": cand, "tipo": tipo,
+                               "rotulo": f"{cand} · {TIPOS_OK[tipo]}"})
+            break
+    return resultados
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -365,66 +399,71 @@ def grafico_dividendos(divs):
 # --------------------------------------------------------------------- app
 def main():
     st.title("📈 Analisador de Ativos")
-    st.caption("Dados do Yahoo Finance. Ferramenta de apoio à pesquisa, "
-               "não é recomendação de compra ou venda.")
+    st.caption("Ações, FIIs, ETFs e criptomoedas. Dados do Yahoo Finance. "
+               "Ferramenta de apoio à pesquisa, não é recomendação de compra ou venda.")
 
     with st.sidebar:
         st.header("Ativo")
-        mercado = st.radio("Mercado", ["Brasil (B3)", "Outro (EUA etc.)"])
-        exemplo = "PETR4" if mercado == "Brasil (B3)" else "AAPL"
-        texto = st.text_input("Código (ticker)", value=exemplo)
+        texto = st.text_input("Nome ou código", value="Petrobras",
+                              help="Ex.: Petrobras, Vale, Apple, HGLG11, Bitcoin, Ethereum")
         periodo = st.selectbox(
             "Período dos gráficos",
             ["6 meses", "1 ano", "2 anos", "5 anos"], index=1)
-        st.caption("Para FIIs da B3, digite o código (ex.: HGLG11). "
-                   "A parte fundamentalista pode vir incompleta para FIIs.")
 
-    ticker = normalizar_ticker(texto, mercado)
-    if not ticker:
-        st.info("Digite um código na barra lateral.")
+    resultados = buscar_ativos(texto)
+    if not resultados:
+        st.error("Não encontrei esse ativo. Tente outro nome ou o código "
+                 "(ex.: PETR4, BTC-USD).")
         return
+    with st.sidebar:
+        escolha = st.selectbox("Escolha o ativo", resultados,
+                               format_func=lambda r: r["rotulo"])
 
+    ticker = escolha["simbolo"]
     with st.spinner(f"Buscando dados de {ticker}..."):
         hist = carregar_historico(ticker)
         info = carregar_info(ticker)
         divs = carregar_dividendos(ticker)
 
     if hist is None or hist.empty or len(hist) < 30:
-        st.error(f"Não encontrei dados suficientes para {ticker}. "
-                 "Confira o código e o mercado escolhido.")
+        st.error(f"Não encontrei histórico suficiente para {ticker}.")
         return
+
+    cripto = escolha["tipo"] == "CRYPTOCURRENCY" or info.get("quoteType") == "CRYPTOCURRENCY"
+    dias_ano = 365 if cripto else 252  # cripto negocia todos os dias
 
     d = calcular_indicadores(hist)
     u = d.iloc[-1]
     ant = d.iloc[-2]
     preco = float(u["Close"])
     variacao = (preco / float(ant["Close"]) - 1) * 100
-    moeda = info.get("currency", "BRL")
-    simbolo = "R$" if moeda == "BRL" else moeda
+    moeda = info.get("currency", "USD" if cripto else "BRL")
+    simbolo = {"BRL": "R$", "USD": "US$"}.get(moeda, moeda)
 
-    nome = info.get("longName") or info.get("shortName") or ticker
+    nome = info.get("longName") or info.get("shortName") or escolha["rotulo"]
     st.subheader(f"{nome} ({ticker})")
     if info.get("sector"):
         st.caption(f"{info.get('sector')} · {info.get('industry', '')}")
 
-    janela_52 = d.tail(252)
+    janela_52 = d.tail(dias_ano)
     max52, min52 = float(janela_52["High"].max()), float(janela_52["Low"].min())
-    dy12 = dividend_yield_12m(divs, preco)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Preço", f"{simbolo} {br(preco)}", f"{br(variacao)}%")
-    c2.metric("Máx. 52 sem.", f"{simbolo} {br(max52)}",
+    c2.metric("Máx. 12 meses", f"{simbolo} {br(max52)}",
               f"{br((preco / max52 - 1) * 100, 1)}% do topo", delta_color="off")
-    c3.metric("Mín. 52 sem.", f"{simbolo} {br(min52)}",
+    c3.metric("Mín. 12 meses", f"{simbolo} {br(min52)}",
               f"{br((preco / min52 - 1) * 100, 1)}% do fundo", delta_color="off")
     c4.metric("Valor de mercado", grande(num(info, "marketCap")))
 
-    n_dias = {"6 meses": 126, "1 ano": 252, "2 anos": 504, "5 anos": len(d)}[periodo]
+    n_dias = {"6 meses": dias_ano // 2, "1 ano": dias_ano,
+              "2 anos": dias_ano * 2, "5 anos": len(d)}[periodo]
     visivel = d.tail(n_dias)
 
     tendencia = analisar_tendencia(d)
     momento = avaliar_momento(d)
-    fund = avaliar_fundamentos(info, dy12)
+    fund = None if cripto else avaliar_fundamentos(
+        info, dividend_yield_12m(divs, preco))
 
     aba_res, aba_graf, aba_fund, aba_tend, aba_mom = st.tabs(
         ["Resumo", "Gráficos", "Fundamentos", "Tendência e médias", "Momento de compra"])
@@ -432,8 +471,11 @@ def main():
     # ---- Resumo
     with aba_res:
         a, b, c = st.columns(3)
-        a.metric("Fundamentos", fund["leitura"],
-                 f"{fund['aprovados']}/{fund['total']} critérios", delta_color="off")
+        if fund:
+            a.metric("Fundamentos", fund["leitura"],
+                     f"{fund['aprovados']}/{fund['total']} critérios", delta_color="off")
+        else:
+            a.metric("Fundamentos", "Não se aplica", "criptomoeda", delta_color="off")
         b.metric("Tendência", tendencia["geral"].replace("Tendência de ", "").replace("Tendência ", ""))
         c.metric("Momento técnico", momento["veredito"],
                  f"{momento['total']:+d} de ±{momento['maximo']}", delta_color="off")
@@ -442,6 +484,9 @@ def main():
             "**direção** (tendência) e **timing** (sinais técnicos). "
             "Um ativo pode ter bons fundamentos e mau momento técnico, e vice-versa. "
             "Veja o detalhe nas outras abas.")
+        if cripto:
+            st.warning("Criptomoedas são muito mais voláteis que ações e não têm balanço "
+                       "nem lucro. A análise aqui é só técnica (preço e volume).")
         alvo = num(info, "targetMeanPrice")
         if alvo:
             st.info(
@@ -455,22 +500,30 @@ def main():
 
     # ---- Fundamentos
     with aba_fund:
-        st.markdown(f"### {fund['leitura']}  ·  {fund['aprovados']} de {fund['total']} critérios atendidos")
-        tabela = pd.DataFrame(
-            [{"Indicador": n, "Valor": v, "Referência": r,
-              "Resultado": "✅" if ok else ("❌" if ok is False else "➖ sem dado")}
-             for n, v, r, ok in fund["criterios"]])
-        st.dataframe(tabela, hide_index=True, use_container_width=True)
-        st.caption("Limites genéricos de referência. Bancos, seguradoras, FIIs e empresas de "
-                   "crescimento têm padrões próprios; compare sempre com o setor.")
+        if cripto:
+            st.markdown("### Criptomoeda: sem fundamentos tradicionais")
+            st.write("Não há P/L, ROE ou dividendos. Alguns dados de mercado:")
+            x1, x2, x3 = st.columns(3)
+            x1.metric("Valor de mercado", grande(num(info, "marketCap")))
+            x2.metric("Oferta circulante", grande(num(info, "circulatingSupply")))
+            x3.metric("Volume 24h", grande(num(info, "volume24Hr") or float(u["Volume"])))
+        else:
+            st.markdown(f"### {fund['leitura']}  ·  {fund['aprovados']} de {fund['total']} critérios atendidos")
+            tabela = pd.DataFrame(
+                [{"Indicador": n, "Valor": v, "Referência": r,
+                  "Resultado": "✅" if ok else ("❌" if ok is False else "➖ sem dado")}
+                 for n, v, r, ok in fund["criterios"]])
+            st.dataframe(tabela, hide_index=True, use_container_width=True)
+            st.caption("Limites genéricos de referência. Bancos, seguradoras, FIIs e empresas de "
+                       "crescimento têm padrões próprios; compare sempre com o setor.")
 
-        x1, x2, x3, x4 = st.columns(4)
-        x1.metric("Lucro por ação (LPA)", br(num(info, "trailingEps")))
-        x2.metric("Valor patrimonial/ação", br(num(info, "bookValue")))
-        x3.metric("Receita (12m)", grande(num(info, "totalRevenue")))
-        x4.metric("Beta", br(num(info, "beta")))
-        if divs is not None and not divs.empty:
-            st.plotly_chart(grafico_dividendos(divs), use_container_width=True)
+            x1, x2, x3, x4 = st.columns(4)
+            x1.metric("Lucro por ação (LPA)", br(num(info, "trailingEps")))
+            x2.metric("Valor patrimonial/ação", br(num(info, "bookValue")))
+            x3.metric("Receita (12m)", grande(num(info, "totalRevenue")))
+            x4.metric("Beta", br(num(info, "beta")))
+            if divs is not None and not divs.empty:
+                st.plotly_chart(grafico_dividendos(divs), use_container_width=True)
 
     # ---- Tendência e médias
     with aba_tend:
@@ -496,7 +549,7 @@ def main():
 
         st.markdown("#### Volume de negociação")
         v1, v2, v3 = st.columns(3)
-        v1.metric("Último pregão", grande(float(u["Volume"])))
+        v1.metric("Último dia", grande(float(u["Volume"])))
         v2.metric("Média 20 dias", grande(float(u["VOL_MM20"])))
         v3.metric("Média 1 ano", grande(float(janela_52["Volume"].mean())))
 
@@ -527,3 +580,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+            
