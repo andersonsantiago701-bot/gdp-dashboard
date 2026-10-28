@@ -1,151 +1,529 @@
-import streamlit as st
+"""
+Analisador de Ativos — app Streamlit
+Dados: Yahoo Finance via yfinance (sem chave de API).
+Ferramenta de apoio à pesquisa. Não é recomendação de compra ou venda.
+"""
+
+import numpy as np
 import pandas as pd
-import math
-from pathlib import Path
+import plotly.graph_objects as go
+import streamlit as st
+import yfinance as yf
+from plotly.subplots import make_subplots
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
-
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
-
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
-
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
-
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
-
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
-
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
-
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
-
-    return gdp_df
-
-gdp_df = get_gdp_data()
-
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
+st.set_page_config(page_title="Analisador de Ativos", page_icon="📈", layout="wide")
 
 
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
+# ---------------------------------------------------------------- formatação
+def br(v, casas=2):
+    """Número no padrão brasileiro (1.234,56)."""
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "—"
+    s = f"{v:,.{casas}f}"
+    return s.replace(",", "X").replace(".", ",").replace("X", ".")
 
-st.header(f'GDP in {to_year}', divider='gray')
 
-''
+def pct(v, casas=1):
+    return "—" if v is None else f"{br(v, casas)}%"
 
-cols = st.columns(4)
 
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
+def grande(v):
+    """Valores grandes em mi / bi / tri."""
+    if v is None:
+        return "—"
+    for lim, suf in ((1e12, "tri"), (1e9, "bi"), (1e6, "mi")):
+        if abs(v) >= lim:
+            return f"{br(v / lim, 2)} {suf}"
+    return br(v, 0)
 
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
 
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
+def num(info, chave):
+    v = info.get(chave)
+    if isinstance(v, (int, float)) and not np.isnan(v):
+        return float(v)
+    return None
 
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
+
+# -------------------------------------------------------------------- dados
+def normalizar_ticker(texto, mercado):
+    t = texto.strip().upper()
+    if mercado == "Brasil (B3)" and t and not t.endswith(".SA"):
+        t += ".SA"
+    return t
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def carregar_historico(ticker):
+    df = yf.Ticker(ticker).history(period="5y", auto_adjust=True)
+    if df.empty:
+        return df
+    df.index = df.index.tz_localize(None)
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def carregar_info(ticker):
+    try:
+        return yf.Ticker(ticker).info or {}
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def carregar_dividendos(ticker):
+    try:
+        d = yf.Ticker(ticker).dividends
+        d.index = d.index.tz_localize(None)
+        return d
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+# -------------------------------------------------------------- indicadores
+def calcular_indicadores(df):
+    d = df.copy()
+    c = d["Close"]
+
+    for n in (20, 50, 200):
+        d[f"SMA{n}"] = c.rolling(n).mean()
+
+    # Bandas de Bollinger (20, 2)
+    media = c.rolling(20).mean()
+    desvio = c.rolling(20).std()
+    d["BB_sup"] = media + 2 * desvio
+    d["BB_inf"] = media - 2 * desvio
+
+    # RSI (14, suavização de Wilder)
+    delta = c.diff()
+    ganho = delta.clip(lower=0)
+    perda = -delta.clip(upper=0)
+    mg = ganho.ewm(alpha=1 / 14, adjust=False).mean()
+    mp = perda.ewm(alpha=1 / 14, adjust=False).mean()
+    rs = mg / mp
+    d["RSI"] = 100 - 100 / (1 + rs)
+
+    # MACD (12, 26, 9)
+    ema12 = c.ewm(span=12, adjust=False).mean()
+    ema26 = c.ewm(span=26, adjust=False).mean()
+    d["MACD"] = ema12 - ema26
+    d["MACD_sinal"] = d["MACD"].ewm(span=9, adjust=False).mean()
+    d["MACD_hist"] = d["MACD"] - d["MACD_sinal"]
+
+    # Volume
+    d["VOL_MM20"] = d["Volume"].rolling(20).mean()
+    return d
+
+
+def analisar_tendencia(d):
+    """Lê a tendência atual a partir das médias móveis."""
+    u = d.iloc[-1]
+    preco = u["Close"]
+    itens = []
+
+    def rotulo(media, nome):
+        if pd.isna(media):
+            return ("—", f"Dados insuficientes para {nome}")
+        if preco > media:
+            return ("Alta", f"Preço acima da {nome} ({pct((preco / media - 1) * 100)})")
+        return ("Baixa", f"Preço abaixo da {nome} ({pct((preco / media - 1) * 100)})")
+
+    curto = rotulo(u["SMA20"], "média de 20 dias")
+    medio = rotulo(u["SMA50"], "média de 50 dias")
+    longo = rotulo(u["SMA200"], "média de 200 dias")
+
+    cruz = "—"
+    if pd.notna(u["SMA50"]) and pd.notna(u["SMA200"]):
+        cruz = (
+            "SMA50 acima da SMA200 (configuração de alta)"
+            if u["SMA50"] > u["SMA200"]
+            else "SMA50 abaixo da SMA200 (configuração de baixa)"
         )
+
+    inclinacao = None
+    s50 = d["SMA50"].dropna()
+    if len(s50) > 21:
+        inclinacao = (s50.iloc[-1] / s50.iloc[-21] - 1) * 100
+
+    itens.append(("Curto prazo", *curto))
+    itens.append(("Médio prazo", *medio))
+    itens.append(("Longo prazo", *longo))
+
+    altas = sum(1 for _, r, _ in itens if r == "Alta")
+    baixas = sum(1 for _, r, _ in itens if r == "Baixa")
+    if altas == 3:
+        geral = "Tendência de ALTA"
+    elif baixas == 3:
+        geral = "Tendência de BAIXA"
+    else:
+        geral = "Tendência LATERAL / em transição"
+
+    return {"geral": geral, "itens": itens, "cruzamento": cruz, "inclinacao": inclinacao}
+
+
+def avaliar_momento(d):
+    """Pontua sinais técnicos. Quanto maior, mais favorável o momento técnico."""
+    u = d.iloc[-1]
+    ant = d.iloc[-2] if len(d) > 1 else u
+    preco = u["Close"]
+    sinais = []  # (nome, pontos, explicação)
+
+    # RSI
+    rsi = u["RSI"]
+    if pd.notna(rsi):
+        if rsi < 30:
+            p, t = 2, f"RSI {br(rsi, 0)}: sobrevendido (possível exagero de queda)"
+        elif rsi < 45:
+            p, t = 1, f"RSI {br(rsi, 0)}: fraco, perto de região de compra"
+        elif rsi <= 65:
+            p, t = 0, f"RSI {br(rsi, 0)}: neutro"
+        elif rsi <= 70:
+            p, t = -1, f"RSI {br(rsi, 0)}: esticado"
+        else:
+            p, t = -2, f"RSI {br(rsi, 0)}: sobrecomprado (risco de correção)"
+        sinais.append(("RSI (14)", p, t))
+
+    # Bollinger
+    if pd.notna(u["BB_sup"]) and u["BB_sup"] != u["BB_inf"]:
+        pb = (preco - u["BB_inf"]) / (u["BB_sup"] - u["BB_inf"])
+        if pb < 0.1:
+            p, t = 1, "Preço junto à banda inferior de Bollinger"
+        elif pb > 0.9:
+            p, t = -1, "Preço junto à banda superior de Bollinger"
+        else:
+            p, t = 0, "Preço no meio das bandas de Bollinger"
+        sinais.append(("Bollinger", p, t))
+
+    # MACD
+    if pd.notna(u["MACD_hist"]) and pd.notna(ant["MACD_hist"]):
+        if u["MACD_hist"] > 0 and u["MACD_hist"] >= ant["MACD_hist"]:
+            p, t = 1, "MACD acima da linha de sinal e ganhando força"
+        elif u["MACD_hist"] < 0 and u["MACD_hist"] <= ant["MACD_hist"]:
+            p, t = -1, "MACD abaixo da linha de sinal e perdendo força"
+        else:
+            p, t = 0, "MACD sem direção clara"
+        sinais.append(("MACD", p, t))
+
+    # Tendência
+    if pd.notna(u["SMA200"]):
+        sinais.append(
+            ("Tendência longa", 1 if preco > u["SMA200"] else -1,
+             "Preço acima da média de 200 dias" if preco > u["SMA200"]
+             else "Preço abaixo da média de 200 dias")
+        )
+    if pd.notna(u["SMA50"]):
+        sinais.append(
+            ("Tendência média", 1 if preco > u["SMA50"] else -1,
+             "Preço acima da média de 50 dias" if preco > u["SMA50"]
+             else "Preço abaixo da média de 50 dias")
+        )
+
+    # Volume
+    if pd.notna(u["VOL_MM20"]) and u["VOL_MM20"] > 0:
+        razao = u["Volume"] / u["VOL_MM20"]
+        subiu = preco >= ant["Close"]
+        if razao >= 1.5 and subiu:
+            p, t = 1, f"Volume {br(razao, 1)}x a média, com preço subindo (confirma alta)"
+        elif razao >= 1.5 and not subiu:
+            p, t = -1, f"Volume {br(razao, 1)}x a média, com preço caindo (pressão vendedora)"
+        else:
+            p, t = 0, f"Volume {br(razao, 1)}x a média (sem sinal forte)"
+        sinais.append(("Volume", p, t))
+
+    total = sum(p for _, p, _ in sinais)
+    maximo = 7
+    if total >= 4:
+        veredito = "Favorável"
+    elif total >= 1:
+        veredito = "Levemente favorável"
+    elif total >= -1:
+        veredito = "Neutro"
+    elif total >= -3:
+        veredito = "Cautela"
+    else:
+        veredito = "Desfavorável"
+
+    janela = d.tail(60)
+    return {
+        "sinais": sinais,
+        "total": total,
+        "maximo": maximo,
+        "veredito": veredito,
+        "suporte": janela["Low"].min(),
+        "resistencia": janela["High"].max(),
+        "bb_inf": u["BB_inf"],
+        "sma50": u["SMA50"],
+    }
+
+
+def avaliar_fundamentos(info, dy12m):
+    """Checklist de referência. Os limites são genéricos e variam por setor."""
+    pl = num(info, "trailingPE")
+    pvp = num(info, "priceToBook")
+    roe = num(info, "returnOnEquity")
+    margem = num(info, "profitMargins")
+    divida = num(info, "debtToEquity")
+    cresc = num(info, "revenueGrowth")
+    liquidez = num(info, "currentRatio")
+    ev_ebitda = num(info, "enterpriseToEbitda")
+
+    roe = roe * 100 if roe is not None else None
+    margem = margem * 100 if margem is not None else None
+    cresc = cresc * 100 if cresc is not None else None
+
+    def teste(valor, cond):
+        return None if valor is None else bool(cond(valor))
+
+    criterios = [
+        ("P/L", br(pl), "entre 0 e 15", teste(pl, lambda v: 0 < v <= 15)),
+        ("P/VP", br(pvp), "até 2", teste(pvp, lambda v: 0 < v <= 2)),
+        ("EV/EBITDA", br(ev_ebitda), "entre 0 e 10", teste(ev_ebitda, lambda v: 0 < v <= 10)),
+        ("Dividend Yield (12m)", pct(dy12m), "a partir de 4%", teste(dy12m, lambda v: v >= 4)),
+        ("ROE", pct(roe), "a partir de 15%", teste(roe, lambda v: v >= 15)),
+        ("Margem líquida", pct(margem), "a partir de 10%", teste(margem, lambda v: v >= 10)),
+        ("Dívida / Patrimônio", pct(divida), "até 100%", teste(divida, lambda v: v <= 100)),
+        ("Liquidez corrente", br(liquidez), "a partir de 1", teste(liquidez, lambda v: v >= 1)),
+        ("Crescimento da receita", pct(cresc), "positivo", teste(cresc, lambda v: v > 0)),
+    ]
+    avaliados = [c for c in criterios if c[3] is not None]
+    aprovados = sum(1 for c in avaliados if c[3])
+    nota = aprovados / len(avaliados) if avaliados else None
+    if nota is None:
+        leitura = "Sem dados suficientes"
+    elif nota >= 0.7:
+        leitura = "Fundamentos sólidos"
+    elif nota >= 0.4:
+        leitura = "Fundamentos mistos"
+    else:
+        leitura = "Fundamentos fracos"
+    return {
+        "criterios": criterios,
+        "aprovados": aprovados,
+        "total": len(avaliados),
+        "leitura": leitura,
+    }
+
+
+def dividend_yield_12m(divs, preco):
+    if divs is None or divs.empty or not preco:
+        return None
+    corte = divs.index.max() - pd.Timedelta(days=365)
+    soma = divs[divs.index > corte].sum()
+    return float(soma / preco * 100) if soma > 0 else 0.0
+
+
+# ----------------------------------------------------------------- gráficos
+def grafico_principal(d):
+    fig = make_subplots(
+        rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+        row_heights=[0.5, 0.15, 0.15, 0.2],
+        subplot_titles=("Preço e médias", "Volume", "RSI (14)", "MACD"),
+    )
+    fig.add_trace(go.Candlestick(
+        x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"],
+        name="Preço"), row=1, col=1)
+    for col, nome in (("SMA20", "Média 20"), ("SMA50", "Média 50"), ("SMA200", "Média 200")):
+        fig.add_trace(go.Scatter(x=d.index, y=d[col], name=nome, line=dict(width=1.3)),
+                      row=1, col=1)
+    for col, nome in (("BB_sup", "Bollinger sup."), ("BB_inf", "Bollinger inf.")):
+        fig.add_trace(go.Scatter(x=d.index, y=d[col], name=nome,
+                                 line=dict(width=1, dash="dot", color="gray")),
+                      row=1, col=1)
+
+    cores = np.where(d["Close"] >= d["Open"], "#26a69a", "#ef5350")
+    fig.add_trace(go.Bar(x=d.index, y=d["Volume"], marker_color=cores, name="Volume"),
+                  row=2, col=1)
+    fig.add_trace(go.Scatter(x=d.index, y=d["VOL_MM20"], name="Volume médio 20d",
+                             line=dict(width=1.3, color="orange")), row=2, col=1)
+
+    fig.add_trace(go.Scatter(x=d.index, y=d["RSI"], name="RSI",
+                             line=dict(width=1.3, color="purple")), row=3, col=1)
+    fig.add_hline(y=70, line_dash="dot", line_color="red", row=3, col=1)
+    fig.add_hline(y=30, line_dash="dot", line_color="green", row=3, col=1)
+
+    cores_h = np.where(d["MACD_hist"] >= 0, "#26a69a", "#ef5350")
+    fig.add_trace(go.Bar(x=d.index, y=d["MACD_hist"], marker_color=cores_h,
+                         name="Histograma"), row=4, col=1)
+    fig.add_trace(go.Scatter(x=d.index, y=d["MACD"], name="MACD",
+                             line=dict(width=1.2)), row=4, col=1)
+    fig.add_trace(go.Scatter(x=d.index, y=d["MACD_sinal"], name="Sinal",
+                             line=dict(width=1.2)), row=4, col=1)
+
+    fig.update_layout(height=950, xaxis_rangeslider_visible=False,
+                      legend=dict(orientation="h", y=1.05),
+                      margin=dict(l=10, r=10, t=60, b=10))
+    return fig
+
+
+def grafico_dividendos(divs):
+    por_ano = divs.groupby(divs.index.year).sum()
+    fig = go.Figure(go.Bar(x=por_ano.index.astype(str), y=por_ano.values))
+    fig.update_layout(title="Dividendos pagos por ano (por ação)", height=320,
+                      margin=dict(l=10, r=10, t=50, b=10))
+    return fig
+
+
+# --------------------------------------------------------------------- app
+def main():
+    st.title("📈 Analisador de Ativos")
+    st.caption("Dados do Yahoo Finance. Ferramenta de apoio à pesquisa, "
+               "não é recomendação de compra ou venda.")
+
+    with st.sidebar:
+        st.header("Ativo")
+        mercado = st.radio("Mercado", ["Brasil (B3)", "Outro (EUA etc.)"])
+        exemplo = "PETR4" if mercado == "Brasil (B3)" else "AAPL"
+        texto = st.text_input("Código (ticker)", value=exemplo)
+        periodo = st.selectbox(
+            "Período dos gráficos",
+            ["6 meses", "1 ano", "2 anos", "5 anos"], index=1)
+        st.caption("Para FIIs da B3, digite o código (ex.: HGLG11). "
+                   "A parte fundamentalista pode vir incompleta para FIIs.")
+
+    ticker = normalizar_ticker(texto, mercado)
+    if not ticker:
+        st.info("Digite um código na barra lateral.")
+        return
+
+    with st.spinner(f"Buscando dados de {ticker}..."):
+        hist = carregar_historico(ticker)
+        info = carregar_info(ticker)
+        divs = carregar_dividendos(ticker)
+
+    if hist is None or hist.empty or len(hist) < 30:
+        st.error(f"Não encontrei dados suficientes para {ticker}. "
+                 "Confira o código e o mercado escolhido.")
+        return
+
+    d = calcular_indicadores(hist)
+    u = d.iloc[-1]
+    ant = d.iloc[-2]
+    preco = float(u["Close"])
+    variacao = (preco / float(ant["Close"]) - 1) * 100
+    moeda = info.get("currency", "BRL")
+    simbolo = "R$" if moeda == "BRL" else moeda
+
+    nome = info.get("longName") or info.get("shortName") or ticker
+    st.subheader(f"{nome} ({ticker})")
+    if info.get("sector"):
+        st.caption(f"{info.get('sector')} · {info.get('industry', '')}")
+
+    janela_52 = d.tail(252)
+    max52, min52 = float(janela_52["High"].max()), float(janela_52["Low"].min())
+    dy12 = dividend_yield_12m(divs, preco)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Preço", f"{simbolo} {br(preco)}", f"{br(variacao)}%")
+    c2.metric("Máx. 52 sem.", f"{simbolo} {br(max52)}",
+              f"{br((preco / max52 - 1) * 100, 1)}% do topo", delta_color="off")
+    c3.metric("Mín. 52 sem.", f"{simbolo} {br(min52)}",
+              f"{br((preco / min52 - 1) * 100, 1)}% do fundo", delta_color="off")
+    c4.metric("Valor de mercado", grande(num(info, "marketCap")))
+
+    n_dias = {"6 meses": 126, "1 ano": 252, "2 anos": 504, "5 anos": len(d)}[periodo]
+    visivel = d.tail(n_dias)
+
+    tendencia = analisar_tendencia(d)
+    momento = avaliar_momento(d)
+    fund = avaliar_fundamentos(info, dy12)
+
+    aba_res, aba_graf, aba_fund, aba_tend, aba_mom = st.tabs(
+        ["Resumo", "Gráficos", "Fundamentos", "Tendência e médias", "Momento de compra"])
+
+    # ---- Resumo
+    with aba_res:
+        a, b, c = st.columns(3)
+        a.metric("Fundamentos", fund["leitura"],
+                 f"{fund['aprovados']}/{fund['total']} critérios", delta_color="off")
+        b.metric("Tendência", tendencia["geral"].replace("Tendência de ", "").replace("Tendência ", ""))
+        c.metric("Momento técnico", momento["veredito"],
+                 f"{momento['total']:+d} de ±{momento['maximo']}", delta_color="off")
+        st.write(
+            "O resumo cruza três leituras independentes: **valor** (fundamentos), "
+            "**direção** (tendência) e **timing** (sinais técnicos). "
+            "Um ativo pode ter bons fundamentos e mau momento técnico, e vice-versa. "
+            "Veja o detalhe nas outras abas.")
+        alvo = num(info, "targetMeanPrice")
+        if alvo:
+            st.info(
+                f"Preço-alvo médio dos analistas (Yahoo): {simbolo} {br(alvo)} "
+                f"({br((alvo / preco - 1) * 100, 1)}% vs. preço atual). "
+                "Projeções de analistas costumam errar e variam bastante.")
+
+    # ---- Gráficos
+    with aba_graf:
+        st.plotly_chart(grafico_principal(visivel), use_container_width=True)
+
+    # ---- Fundamentos
+    with aba_fund:
+        st.markdown(f"### {fund['leitura']}  ·  {fund['aprovados']} de {fund['total']} critérios atendidos")
+        tabela = pd.DataFrame(
+            [{"Indicador": n, "Valor": v, "Referência": r,
+              "Resultado": "✅" if ok else ("❌" if ok is False else "➖ sem dado")}
+             for n, v, r, ok in fund["criterios"]])
+        st.dataframe(tabela, hide_index=True, use_container_width=True)
+        st.caption("Limites genéricos de referência. Bancos, seguradoras, FIIs e empresas de "
+                   "crescimento têm padrões próprios; compare sempre com o setor.")
+
+        x1, x2, x3, x4 = st.columns(4)
+        x1.metric("Lucro por ação (LPA)", br(num(info, "trailingEps")))
+        x2.metric("Valor patrimonial/ação", br(num(info, "bookValue")))
+        x3.metric("Receita (12m)", grande(num(info, "totalRevenue")))
+        x4.metric("Beta", br(num(info, "beta")))
+        if divs is not None and not divs.empty:
+            st.plotly_chart(grafico_dividendos(divs), use_container_width=True)
+
+    # ---- Tendência e médias
+    with aba_tend:
+        st.markdown(f"### {tendencia['geral']}")
+        for prazo, rot, txt in tendencia["itens"]:
+            st.write(f"**{prazo}:** {rot}. {txt}")
+        st.write(f"**Cruzamento de médias:** {tendencia['cruzamento']}")
+        if tendencia["inclinacao"] is not None:
+            st.write(f"**Inclinação da média de 50 dias (último mês):** "
+                     f"{pct(tendencia['inclinacao'])}")
+
+        linhas = []
+        for n in (20, 50, 200):
+            m = u[f"SMA{n}"]
+            linhas.append({
+                "Média": f"Simples {n} dias",
+                "Valor": br(m) if pd.notna(m) else "—",
+                "Preço vs. média": pct((preco / m - 1) * 100) if pd.notna(m) else "—"})
+        m_ano = float(janela_52["Close"].mean())
+        linhas.append({"Média": "Último ano", "Valor": br(m_ano),
+                       "Preço vs. média": pct((preco / m_ano - 1) * 100)})
+        st.dataframe(pd.DataFrame(linhas), hide_index=True, use_container_width=True)
+
+        st.markdown("#### Volume de negociação")
+        v1, v2, v3 = st.columns(3)
+        v1.metric("Último pregão", grande(float(u["Volume"])))
+        v2.metric("Média 20 dias", grande(float(u["VOL_MM20"])))
+        v3.metric("Média 1 ano", grande(float(janela_52["Volume"].mean())))
+
+    # ---- Momento de compra
+    with aba_mom:
+        st.markdown(f"### Momento técnico: {momento['veredito']} "
+                    f"({momento['total']:+d} de ±{momento['maximo']})")
+        st.dataframe(
+            pd.DataFrame([{"Sinal": n, "Pontos": f"{p:+d}", "Leitura": t}
+                          for n, p, t in momento["sinais"]]),
+            hide_index=True, use_container_width=True)
+
+        st.markdown("#### Níveis para observar")
+        n1, n2, n3, n4 = st.columns(4)
+        n1.metric("Suporte (60 dias)", f"{simbolo} {br(momento['suporte'])}")
+        n2.metric("Resistência (60 dias)", f"{simbolo} {br(momento['resistencia'])}")
+        n3.metric("Banda inferior Bollinger", f"{simbolo} {br(momento['bb_inf'])}")
+        n4.metric("Média 50 dias", f"{simbolo} {br(momento['sma50'])}")
+        st.write(
+            "Regiões próximas ao suporte, à banda inferior ou à média de 50 dias costumam ser "
+            "pontos de observação para entradas, ao passo que rompimentos abaixo do suporte "
+            "indicam que a leitura pode estar errada.")
+        st.warning(
+            "O placar mede apenas o momento técnico, com regras simples e conhecidas. "
+            "Ele não prevê preços e ignora notícias, resultados e o seu perfil de risco. "
+            "Não é recomendação de investimento.")
+
+
+if __name__ == "__main__":
+    main()
