@@ -3,3 +3,5 @@ yfinance>=0.2.54
 pandas
 numpy
 plotly
+requests
+
