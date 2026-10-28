@@ -4,8 +4,16 @@ Dados: Yahoo Finance via yfinance (sem chave de API).
 Ferramenta de apoio à pesquisa. Não é recomendação de compra ou venda.
 """
 
+import datetime as dt
+import json
+import uuid
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote_plus
+
 import numpy as np
 import pandas as pd
+import requests
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
@@ -66,7 +74,7 @@ def buscar_ativos(consulta):
         nome = q.get("longname") or q.get("shortname") or simbolo
         bolsa = q.get("exchDisp") or q.get("exchange") or ""
         resultados.append({
-            "simbolo": simbolo, "tipo": tipo,
+            "simbolo": simbolo, "tipo": tipo, "nome": nome,
             "rotulo": f"{nome} ({simbolo}) · {TIPOS_OK[tipo]} · {bolsa}"})
     if resultados:
         return resultados
@@ -80,7 +88,7 @@ def buscar_ativos(consulta):
             continue
         if not h.empty:
             tipo = "CRYPTOCURRENCY" if cand.endswith("-USD") else "EQUITY"
-            resultados.append({"simbolo": cand, "tipo": tipo,
+            resultados.append({"simbolo": cand, "tipo": tipo, "nome": cand,
                                "rotulo": f"{cand} · {TIPOS_OK[tipo]}"})
             break
     return resultados
@@ -396,29 +404,231 @@ def grafico_dividendos(divs):
     return fig
 
 
-# --------------------------------------------------------------------- app
-def main():
-    st.title("📈 Analisador de Ativos")
-    st.caption("Ações, FIIs, ETFs e criptomoedas. Dados do Yahoo Finance. "
-               "Ferramenta de apoio à pesquisa, não é recomendação de compra ou venda.")
+# ------------------------------------------------- favoritos e alertas (salvos)
+ARQ_DADOS = "dados.json"
+TIPOS_ALERTA = {
+    "preco_abaixo": "Preço cair até",
+    "preco_acima": "Preço subir até",
+    "rsi_abaixo": "RSI cair até (sobrevendido)",
+}
 
-    with st.sidebar:
-        st.header("Ativo")
-        texto = st.text_input("Nome ou código", value="Petrobras",
-                              help="Ex.: Petrobras, Vale, Apple, HGLG11, Bitcoin, Ethereum")
-        periodo = st.selectbox(
-            "Período dos gráficos",
-            ["6 meses", "1 ano", "2 anos", "5 anos"], index=1)
 
-    resultados = buscar_ativos(texto)
-    if not resultados:
-        st.error("Não encontrei esse ativo. Tente outro nome ou o código "
-                 "(ex.: PETR4, BTC-USD).")
+def _vazio():
+    return {"favoritos": [], "alertas": []}
+
+
+def _config_gist():
+    try:
+        return st.secrets["GIST_TOKEN"], st.secrets["GIST_ID"]
+    except Exception:
+        return None, None
+
+
+def _cab(token):
+    return {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+
+
+def _ler_gist():
+    token, gid = _config_gist()
+    r = requests.get(f"https://api.github.com/gists/{gid}", headers=_cab(token), timeout=15)
+    r.raise_for_status()
+    arq = r.json().get("files", {}).get(ARQ_DADOS)
+    dados = json.loads(arq.get("content") or "{}") if arq else {}
+    dados.setdefault("favoritos", [])
+    dados.setdefault("alertas", [])
+    return dados
+
+
+def _gravar_gist(dados):
+    token, gid = _config_gist()
+    corpo = {"files": {ARQ_DADOS: {"content": json.dumps(dados, ensure_ascii=False, indent=2)}}}
+    r = requests.patch(f"https://api.github.com/gists/{gid}", headers=_cab(token),
+                       json=corpo, timeout=15)
+    r.raise_for_status()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _ler_gist_cache(gid):
+    return _ler_gist()
+
+
+def ler_dados():
+    """Devolve (dados, salvamento_ativo). Sem configuração, vale só durante a sessão."""
+    token, gid = _config_gist()
+    if token:
+        try:
+            return _ler_gist_cache(gid), True
+        except Exception as e:
+            st.session_state["erro_salvar"] = f"Não consegui ler o salvamento no GitHub ({e})."
+    return st.session_state.setdefault("dados", _vazio()), False
+
+
+def mutar(fn):
+    """Lê o dado mais recente, aplica a mudança e grava."""
+    token, _ = _config_gist()
+    if token:
+        try:
+            dados = _ler_gist()
+            fn(dados)
+            _gravar_gist(dados)
+            _ler_gist_cache.clear()
+        except Exception as e:
+            st.session_state["erro_salvar"] = f"Não consegui salvar no GitHub ({e})."
         return
-    with st.sidebar:
-        escolha = st.selectbox("Escolha o ativo", resultados,
-                               format_func=lambda r: r["rotulo"])
+    fn(st.session_state.setdefault("dados", _vazio()))
 
+
+def alternar_favorito(escolha):
+    def fn(d):
+        if any(f["simbolo"] == escolha["simbolo"] for f in d["favoritos"]):
+            d["favoritos"] = [f for f in d["favoritos"] if f["simbolo"] != escolha["simbolo"]]
+        else:
+            d["favoritos"].append({"simbolo": escolha["simbolo"], "tipo": escolha["tipo"],
+                                   "nome": escolha["nome"]})
+    mutar(fn)
+
+
+def criar_alerta(escolha, tipo, valor):
+    def fn(d):
+        d["alertas"].append({
+            "id": uuid.uuid4().hex[:8], "simbolo": escolha["simbolo"], "nome": escolha["nome"],
+            "tipo": tipo, "valor": float(valor), "criado": dt.date.today().isoformat(),
+            "disparado_em": None})
+    mutar(fn)
+
+
+def remover_alerta(id_):
+    mutar(lambda d: d.update(alertas=[a for a in d["alertas"] if a["id"] != id_]))
+
+
+def reativar_alerta(id_):
+    def fn(d):
+        for a in d["alertas"]:
+            if a["id"] == id_:
+                a["disparado_em"] = None
+    mutar(fn)
+
+
+def moeda_de(simbolo):
+    return "R$" if simbolo.endswith(".SA") else "US$"
+
+
+def alerta_atingido(a, preco, rsi):
+    if a["tipo"] == "preco_abaixo":
+        return preco <= a["valor"]
+    if a["tipo"] == "preco_acima":
+        return preco >= a["valor"]
+    if a["tipo"] == "rsi_abaixo":
+        return rsi is not None and rsi <= a["valor"]
+    return False
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def resumo_ativo(ticker):
+    h = carregar_historico(ticker)
+    if h is None or h.empty or len(h) < 30:
+        return None
+    d = calcular_indicadores(h)
+    u, ant = d.iloc[-1], d.iloc[-2]
+    return {
+        "preco": float(u["Close"]),
+        "dia": (float(u["Close"]) / float(ant["Close"]) - 1) * 100,
+        "rsi": float(u["RSI"]) if pd.notna(u["RSI"]) else None,
+        "tendencia": analisar_tendencia(d)["geral"].replace("Tendência de ", "").replace("Tendência ", ""),
+        "momento": avaliar_momento(d)["veredito"],
+    }
+
+
+def alertas_atingidos(dados):
+    saida = []
+    for a in dados["alertas"]:
+        if a.get("disparado_em"):
+            continue
+        r = resumo_ativo(a["simbolo"])
+        if r and alerta_atingido(a, r["preco"], r["rsi"]):
+            saida.append((a, r))
+    return saida
+
+
+# ----------------------------------------------------------------- notícias
+def url_google_noticias(consulta):
+    return ("https://news.google.com/rss/search?q=" + quote_plus(consulta + " when:2d")
+            + "&hl=pt-BR&gl=BR&ceid=BR:pt-419")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def ler_noticias(url, fonte_padrao):
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+        r.raise_for_status()
+        raiz = ET.fromstring(r.content)
+    except Exception:
+        return []
+    itens = []
+    for it in raiz.iter("item"):
+        titulo = (it.findtext("title") or "").strip()
+        link = (it.findtext("link") or "").strip()
+        if not titulo or not link:
+            continue
+        data = None
+        txt = it.findtext("pubDate")
+        if txt:
+            try:
+                data = parsedate_to_datetime(txt)
+                if data.tzinfo is None:
+                    data = data.replace(tzinfo=dt.timezone.utc)
+            except Exception:
+                data = None
+        fonte = (it.findtext("source") or fonte_padrao).strip()
+        itens.append({"titulo": titulo, "link": link, "data": data, "fonte": fonte})
+    return itens
+
+
+def ha_quanto_tempo(data):
+    if data is None:
+        return ""
+    seg = (dt.datetime.now(dt.timezone.utc) - data).total_seconds()
+    if seg < 0:
+        seg = 0
+    if seg < 3600:
+        return f"há {max(1, int(seg // 60))} min"
+    if seg < 86400:
+        return f"há {int(seg // 3600)} h"
+    return f"há {int(seg // 86400)} d"
+
+
+def juntar_noticias(listas, limite):
+    vistos, todas = set(), []
+    for lista in listas:
+        for n in lista:
+            chave = n["titulo"].lower()[:80]
+            if chave not in vistos:
+                vistos.add(chave)
+                todas.append(n)
+    minimo = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    todas.sort(key=lambda n: n["data"] or minimo, reverse=True)
+    return todas[:limite]
+
+
+def mostrar_noticias(itens):
+    if not itens:
+        st.info("Não consegui carregar notícias agora. Tente atualizar em instantes.")
+        return
+    for n in itens:
+        titulo = n["titulo"].replace("[", "(").replace("]", ")")
+        st.markdown(f"**[{titulo}]({n['link']})**  \n"
+                    f"<small>{n['fonte']} · {ha_quanto_tempo(n['data'])}</small>",
+                    unsafe_allow_html=True)
+
+
+def consulta_do_ativo(escolha):
+    nome = " ".join(escolha["nome"].split()[:3])
+    base = escolha["simbolo"].split(".")[0].split("-")[0]
+    return f"{nome} {base}"
+
+
+# --------------------------------------------------------------------- app
+def render_analise(escolha, periodo):
     ticker = escolha["simbolo"]
     with st.spinner(f"Buscando dados de {ticker}..."):
         hist = carregar_historico(ticker)
@@ -440,7 +650,7 @@ def main():
     moeda = info.get("currency", "USD" if cripto else "BRL")
     simbolo = {"BRL": "R$", "USD": "US$"}.get(moeda, moeda)
 
-    nome = info.get("longName") or info.get("shortName") or escolha["rotulo"]
+    nome = info.get("longName") or info.get("shortName") or escolha["nome"]
     st.subheader(f"{nome} ({ticker})")
     if info.get("sector"):
         st.caption(f"{info.get('sector')} · {info.get('industry', '')}")
@@ -468,7 +678,6 @@ def main():
     aba_res, aba_graf, aba_fund, aba_tend, aba_mom = st.tabs(
         ["Resumo", "Gráficos", "Fundamentos", "Tendência e médias", "Momento de compra"])
 
-    # ---- Resumo
     with aba_res:
         a, b, c = st.columns(3)
         if fund:
@@ -494,11 +703,9 @@ def main():
                 f"({br((alvo / preco - 1) * 100, 1)}% vs. preço atual). "
                 "Projeções de analistas costumam errar e variam bastante.")
 
-    # ---- Gráficos
     with aba_graf:
         st.plotly_chart(grafico_principal(visivel), use_container_width=True)
 
-    # ---- Fundamentos
     with aba_fund:
         if cripto:
             st.markdown("### Criptomoeda: sem fundamentos tradicionais")
@@ -516,7 +723,6 @@ def main():
             st.dataframe(tabela, hide_index=True, use_container_width=True)
             st.caption("Limites genéricos de referência. Bancos, seguradoras, FIIs e empresas de "
                        "crescimento têm padrões próprios; compare sempre com o setor.")
-
             x1, x2, x3, x4 = st.columns(4)
             x1.metric("Lucro por ação (LPA)", br(num(info, "trailingEps")))
             x2.metric("Valor patrimonial/ação", br(num(info, "bookValue")))
@@ -525,7 +731,6 @@ def main():
             if divs is not None and not divs.empty:
                 st.plotly_chart(grafico_dividendos(divs), use_container_width=True)
 
-    # ---- Tendência e médias
     with aba_tend:
         st.markdown(f"### {tendencia['geral']}")
         for prazo, rot, txt in tendencia["itens"]:
@@ -534,7 +739,6 @@ def main():
         if tendencia["inclinacao"] is not None:
             st.write(f"**Inclinação da média de 50 dias (último mês):** "
                      f"{pct(tendencia['inclinacao'])}")
-
         linhas = []
         for n in (20, 50, 200):
             m = u[f"SMA{n}"]
@@ -546,14 +750,12 @@ def main():
         linhas.append({"Média": "Último ano", "Valor": br(m_ano),
                        "Preço vs. média": pct((preco / m_ano - 1) * 100)})
         st.dataframe(pd.DataFrame(linhas), hide_index=True, use_container_width=True)
-
         st.markdown("#### Volume de negociação")
         v1, v2, v3 = st.columns(3)
         v1.metric("Último dia", grande(float(u["Volume"])))
         v2.metric("Média 20 dias", grande(float(u["VOL_MM20"])))
         v3.metric("Média 1 ano", grande(float(janela_52["Volume"].mean())))
 
-    # ---- Momento de compra
     with aba_mom:
         st.markdown(f"### Momento técnico: {momento['veredito']} "
                     f"({momento['total']:+d} de ±{momento['maximo']})")
@@ -561,7 +763,6 @@ def main():
             pd.DataFrame([{"Sinal": n, "Pontos": f"{p:+d}", "Leitura": t}
                           for n, p, t in momento["sinais"]]),
             hide_index=True, use_container_width=True)
-
         st.markdown("#### Níveis para observar")
         n1, n2, n3, n4 = st.columns(4)
         n1.metric("Suporte (60 dias)", f"{simbolo} {br(momento['suporte'])}")
@@ -576,6 +777,171 @@ def main():
             "O placar mede apenas o momento técnico, com regras simples e conhecidas. "
             "Ele não prevê preços e ignora notícias, resultados e o seu perfil de risco. "
             "Não é recomendação de investimento.")
+
+
+def render_favoritos(dados):
+    favs = dados["favoritos"]
+    if not favs:
+        st.info("Você ainda não tem favoritos. Escolha um ativo e toque em "
+                "☆ Favoritar na barra lateral.")
+        return
+    linhas = []
+    for f in favs:
+        r = resumo_ativo(f["simbolo"])
+        m = moeda_de(f["simbolo"])
+        linhas.append({
+            "Ativo": f["nome"], "Código": f["simbolo"],
+            "Preço": f"{m} {br(r['preco'])}" if r else "—",
+            "Dia": pct(r["dia"]) if r else "—",
+            "RSI": br(r["rsi"], 0) if r and r["rsi"] is not None else "—",
+            "Tendência": r["tendencia"] if r else "—",
+            "Momento técnico": r["momento"] if r else "—"})
+    st.dataframe(pd.DataFrame(linhas), hide_index=True, use_container_width=True)
+    st.caption("Para abrir a análise completa, escolha 'Favoritos' na barra lateral.")
+
+
+def render_alertas(dados, escolha, persistente):
+    st.markdown("### Criar alerta")
+    if not persistente:
+        st.warning("O salvamento ainda não está configurado: seus alertas somem ao recarregar "
+                   "a página e nenhuma notificação é enviada. Veja o LEIA-ME-ALERTAS.md.")
+    else:
+        st.caption("As notificações no celular são enviadas pelo verificador automático "
+                   "(passo 5 do LEIA-ME-ALERTAS.md), a cada ~15 minutos.")
+
+    if escolha is None:
+        st.info("Escolha um ativo na barra lateral para criar um alerta para ele.")
+    else:
+        r = resumo_ativo(escolha["simbolo"])
+        m = moeda_de(escolha["simbolo"])
+        if r is None:
+            st.info("Não consegui o preço atual deste ativo agora.")
+        else:
+            st.write(f"**{escolha['nome']}** ({escolha['simbolo']}) · preço atual "
+                     f"{m} {br(r['preco'])}"
+                     + (f" · RSI {br(r['rsi'], 0)}" if r["rsi"] is not None else ""))
+            tipo = st.selectbox("Avisar quando", list(TIPOS_ALERTA),
+                                format_func=lambda t: TIPOS_ALERTA[t],
+                                key="tipo_alerta")
+            if tipo == "rsi_abaixo":
+                valor = st.number_input("RSI igual ou abaixo de", min_value=1.0,
+                                        max_value=99.0, value=30.0, step=1.0, key="v_rsi")
+            else:
+                padrao = round(r["preco"] * (0.95 if tipo == "preco_abaixo" else 1.05), 2)
+                valor = st.number_input(f"Preço ({m})", min_value=0.0, value=padrao,
+                                        step=0.01, format="%.2f", key=f"v_{tipo}_{escolha['simbolo']}")
+            st.button("Criar alerta", on_click=criar_alerta, args=(escolha, tipo, valor),
+                      type="primary")
+            if tipo == "rsi_abaixo":
+                st.caption("RSI abaixo de 30 costuma indicar queda exagerada (sobrevendido). "
+                           "É um sinal de observação, não garantia de reversão.")
+
+    st.markdown("### Meus alertas")
+    if not dados["alertas"]:
+        st.caption("Nenhum alerta criado.")
+        return
+    for a in dados["alertas"]:
+        m = moeda_de(a["simbolo"])
+        alvo = br(a["valor"], 0) if a["tipo"] == "rsi_abaixo" else f"{m} {br(a['valor'])}"
+        if a.get("disparado_em"):
+            estado = "🔔 disparado em " + a["disparado_em"][:16].replace("T", " ") + " UTC"
+        else:
+            estado = "⏳ ativo"
+        col1, col2, col3 = st.columns([6, 2, 2])
+        col1.write(f"**{a['nome']}** ({a['simbolo']}): {TIPOS_ALERTA[a['tipo']]} {alvo} · {estado}")
+        if a.get("disparado_em"):
+            col2.button("Reativar", key=f"re_{a['id']}", on_click=reativar_alerta, args=(a["id"],))
+        col3.button("Excluir", key=f"ex_{a['id']}", on_click=remover_alerta, args=(a["id"],))
+
+
+def render_noticias(dados, escolha):
+    topo1, topo2 = st.columns([3, 1])
+    topo1.caption("Manchetes de InfoMoney e Google Notícias. Atualiza sozinho a cada 5 minutos.")
+    if topo2.button("🔄 Atualizar"):
+        ler_noticias.clear()
+    opcoes = ["Mercado em geral"]
+    if escolha:
+        opcoes.append("Ativo selecionado")
+    if dados["favoritos"]:
+        opcoes.append("Meus favoritos")
+    foco = st.radio("Mostrar", opcoes, horizontal=True)
+
+    if foco == "Mercado em geral":
+        listas = [ler_noticias("https://www.infomoney.com.br/feed/", "InfoMoney"),
+                  ler_noticias(url_google_noticias("mercado financeiro bolsa B3 dólar"),
+                               "Google Notícias")]
+        mostrar_noticias(juntar_noticias(listas, 25))
+    elif foco == "Ativo selecionado":
+        st.write(f"Notícias sobre **{escolha['nome']}**")
+        lista = ler_noticias(url_google_noticias(consulta_do_ativo(escolha)), "Google Notícias")
+        mostrar_noticias(juntar_noticias([lista], 15))
+    else:
+        for f in dados["favoritos"][:6]:
+            st.markdown(f"#### {f['nome']}")
+            lista = ler_noticias(url_google_noticias(consulta_do_ativo(f)), "Google Notícias")
+            mostrar_noticias(juntar_noticias([lista], 3))
+        if len(dados["favoritos"]) > 6:
+            st.caption("Mostrando os 6 primeiros favoritos.")
+
+
+def main():
+    st.title("📈 Analisador de Ativos")
+    st.caption("Ações, FIIs, ETFs e criptomoedas. Dados do Yahoo Finance. "
+               "Ferramenta de apoio à pesquisa, não é recomendação de compra ou venda.")
+
+    dados, persistente = ler_dados()
+    erro = st.session_state.pop("erro_salvar", None)
+    if erro:
+        st.error(erro)
+
+    escolha = None
+    with st.sidebar:
+        st.header("Ativo")
+        modo = "Buscar"
+        if dados["favoritos"]:
+            modo = st.radio("Escolher por", ["Buscar", "Favoritos"], horizontal=True)
+        if modo == "Buscar":
+            texto = st.text_input("Nome ou código", value="Petrobras",
+                                  help="Ex.: Petrobras, Vale, Apple, HGLG11, Bitcoin, Ethereum")
+            resultados = buscar_ativos(texto)
+            if resultados:
+                i = st.selectbox("Escolha o ativo", range(len(resultados)),
+                                 format_func=lambda k: resultados[k]["rotulo"])
+                escolha = resultados[i]
+            else:
+                st.error("Não encontrei esse ativo. Tente outro nome ou o código "
+                         "(ex.: PETR4, BTC-USD).")
+        else:
+            favs = dados["favoritos"]
+            i = st.selectbox("Seus favoritos", range(len(favs)),
+                             format_func=lambda k: f"{favs[k]['nome']} ({favs[k]['simbolo']})")
+            escolha = favs[i]
+        periodo = st.selectbox("Período dos gráficos", ["6 meses", "1 ano", "2 anos", "5 anos"], index=1)
+        if escolha:
+            ja = any(f["simbolo"] == escolha["simbolo"] for f in dados["favoritos"])
+            st.button("★ Remover dos favoritos" if ja else "☆ Favoritar",
+                      on_click=alternar_favorito, args=(escolha,), use_container_width=True)
+        st.caption("💾 Favoritos e alertas salvos." if persistente else
+                   "⚠️ Salvamento não configurado: favoritos e alertas somem ao recarregar.")
+
+    for a, r in alertas_atingidos(dados):
+        m = moeda_de(a["simbolo"])
+        st.warning(f"🔔 Alerta atingido: {a['nome']} ({a['simbolo']}) está em "
+                   f"{m} {br(r['preco'])} · {TIPOS_ALERTA[a['tipo']]} "
+                   + (br(a['valor'], 0) if a['tipo'] == 'rsi_abaixo' else f"{m} {br(a['valor'])}"))
+
+    t_an, t_fav, t_al, t_nt = st.tabs(["Análise", "⭐ Favoritos", "🔔 Alertas", "📰 Notícias"])
+    with t_an:
+        if escolha:
+            render_analise(escolha, periodo)
+        else:
+            st.info("Digite o nome ou código de um ativo na barra lateral.")
+    with t_fav:
+        render_favoritos(dados)
+    with t_al:
+        render_alertas(dados, escolha, persistente)
+    with t_nt:
+        render_noticias(dados, escolha)
 
 
 if __name__ == "__main__":
