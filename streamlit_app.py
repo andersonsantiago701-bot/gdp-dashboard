@@ -1,5 +1,5 @@
 """
-Analisador de Ativos — app Streamlit
+Mercado Todo Dia — app Streamlit
 Dados: Yahoo Finance via yfinance (sem chave de API).
 Ferramenta de apoio à pesquisa. Não é recomendação de compra ou venda.
 """
