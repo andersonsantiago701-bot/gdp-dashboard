@@ -5,9 +5,11 @@ Ferramenta de apoio à pesquisa. Não é recomendação de compra ou venda.
 """
 
 import datetime as dt
+import html
 import json
 import uuid
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote_plus
 
@@ -627,6 +629,74 @@ def consulta_do_ativo(escolha):
     return f"{nome} {base}"
 
 
+# ------------------------------------------------------- barra de cotações
+BARRA_PADRAO = [
+    ("Ibovespa", "^BVSP"), ("Dólar", "USDBRL=X"), ("Euro", "EURBRL=X"),
+    ("Bitcoin", "BTC-USD"), ("Ethereum", "ETH-USD"), ("PETR4", "PETR4.SA"),
+    ("VALE3", "VALE3.SA"), ("ITUB4", "ITUB4.SA"), ("S&P 500", "^GSPC"),
+    ("Nasdaq", "^IXIC"), ("Ouro", "GC=F"),
+]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cotacoes_barra(itens):
+    """itens: tupla de (rótulo, código). Busca em paralelo; ignora o que falhar."""
+    def uma(item):
+        rot, sim = item
+        try:
+            h = yf.Ticker(sim).history(period="5d")["Close"].dropna()
+            if len(h) < 2:
+                return None
+            return rot, sim, float(h.iloc[-1]), (float(h.iloc[-1]) / float(h.iloc[-2]) - 1) * 100
+        except Exception:
+            return None
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        resultados = list(ex.map(uma, itens))
+    return [r for r in resultados if r]
+
+
+def prefixo_moeda(simbolo):
+    if simbolo.endswith(".SA") or simbolo.endswith("BRL=X"):
+        return "R$ "
+    if simbolo.startswith("^"):
+        return ""  # índices, em pontos
+    return "US$ "
+
+
+def html_barra(cotacoes):
+    itens = []
+    for rot, sim, preco, var in cotacoes:
+        cor = "#089981" if var >= 0 else "#F23645"
+        seta = "▲" if var >= 0 else "▼"
+        itens.append(
+            f'<span class="tk-item"><b>{html.escape(rot)}</b> {prefixo_moeda(sim)}{br(preco)} '
+            f'<span style="color:{cor}">{seta} {br(abs(var))}%</span></span>')
+    faixa = "".join(itens)
+    duracao = max(30, 5 * len(itens))
+    css = (
+        "<style>"
+        ".tk-wrap{overflow:hidden;white-space:nowrap;background:#1E222D;"
+        "border-radius:6px;padding:9px 0;margin-bottom:14px}"
+        f".tk-trilho{{display:inline-block;animation:tk-rolar {duracao}s linear infinite}}"
+        ".tk-trilho:hover{animation-play-state:paused}"
+        ".tk-item{display:inline-block;margin:0 22px;color:#D1D4DC;font-size:14px}"
+        "@keyframes tk-rolar{from{transform:translateX(0)}to{transform:translateX(-50%)}}"
+        "</style>")
+    return f'{css}<div class="tk-wrap"><div class="tk-trilho">{faixa}{faixa}</div></div>'
+
+
+def barra_cotacoes(dados):
+    itens = list(BARRA_PADRAO)
+    vistos = {s for _, s in itens}
+    for f in dados["favoritos"]:
+        if f["simbolo"] not in vistos:
+            itens.append((f["simbolo"].split(".")[0], f["simbolo"]))
+            vistos.add(f["simbolo"])
+    cot = cotacoes_barra(tuple(itens))
+    if cot:
+        st.markdown(html_barra(cot), unsafe_allow_html=True)
+
+
 # --------------------------------------------------------------------- app
 def render_analise(escolha, periodo):
     ticker = escolha["simbolo"]
@@ -885,11 +955,12 @@ def render_noticias(dados, escolha):
 
 
 def main():
+    dados, persistente = ler_dados()
+    barra_cotacoes(dados)
     st.title("📈 Analisador de Ativos")
     st.caption("Ações, FIIs, ETFs e criptomoedas. Dados do Yahoo Finance. "
                "Ferramenta de apoio à pesquisa, não é recomendação de compra ou venda.")
 
-    dados, persistente = ler_dados()
     erro = st.session_state.pop("erro_salvar", None)
     if erro:
         st.error(erro)
@@ -946,5 +1017,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-            
