@@ -553,9 +553,10 @@ def alertas_atingidos(dados):
 
 
 # ----------------------------------------------------------------- notícias
-def url_google_noticias(consulta):
+def url_google_noticias(consulta, ingles=False):
+    regiao = "&hl=en-US&gl=US&ceid=US:en" if ingles else "&hl=pt-BR&gl=BR&ceid=BR:pt-419"
     return ("https://news.google.com/rss/search?q=" + quote_plus(consulta + " when:2d")
-            + "&hl=pt-BR&gl=BR&ceid=BR:pt-419")
+            + regiao)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -695,6 +696,43 @@ def barra_cotacoes(dados):
     cot = cotacoes_barra(tuple(itens))
     if cot:
         st.markdown(html_barra(cot), unsafe_allow_html=True)
+
+
+# ------------------------------------------------------------ notícias cripto
+TEMAS_CRIPTO = {  # tema: (busca em português, busca em inglês)
+    "Geral": ("criptomoedas", "cryptocurrency"),
+    "Bitcoin": ("bitcoin", "bitcoin"),
+    "Ethereum": ("ethereum", "ethereum"),
+    "Altcoins": ("altcoins", "altcoins"),
+    "Regulação": ("regulação criptomoedas", "crypto regulation"),
+}
+FEEDS_CRIPTO_EN = {
+    "Geral": [("Cointelegraph", "https://cointelegraph.com/rss"),
+              ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml")],
+    "Bitcoin": [("Cointelegraph", "https://cointelegraph.com/rss/tag/bitcoin")],
+    "Ethereum": [("Cointelegraph", "https://cointelegraph.com/rss/tag/ethereum")],
+    "Altcoins": [("Cointelegraph", "https://cointelegraph.com/rss/tag/altcoins")],
+}
+
+
+def render_cripto():
+    topo1, topo2 = st.columns([3, 1])
+    topo1.caption("Manchetes do mercado cripto. Atualiza sozinho a cada 5 minutos.")
+    if topo2.button("🔄 Atualizar", key="atualizar_cripto"):
+        ler_noticias.clear()
+    idioma = st.radio("Idioma", ["Português", "Inglês (fontes internacionais)"],
+                      horizontal=True, key="idioma_cripto")
+    tema = st.radio("Tema", list(TEMAS_CRIPTO), horizontal=True, key="tema_cripto")
+    busca_pt, busca_en = TEMAS_CRIPTO[tema]
+
+    if idioma == "Português":
+        listas = [ler_noticias(url_google_noticias(busca_pt), "Google Notícias")]
+    else:
+        listas = [ler_noticias(url, fonte) for fonte, url in FEEDS_CRIPTO_EN.get(tema, [])]
+        listas.append(ler_noticias(url_google_noticias(busca_en, ingles=True), "Google News"))
+    mostrar_noticias(juntar_noticias(listas, 25))
+    st.caption("Notícias de cripto misturam análise, opinião e promoção. "
+               "Confira a fonte antes de tomar qualquer decisão.")
 
 
 # --------------------------------------------------------------------- app
@@ -1001,7 +1039,8 @@ def main():
                    f"{m} {br(r['preco'])} · {TIPOS_ALERTA[a['tipo']]} "
                    + (br(a['valor'], 0) if a['tipo'] == 'rsi_abaixo' else f"{m} {br(a['valor'])}"))
 
-    t_an, t_fav, t_al, t_nt = st.tabs(["Análise", "⭐ Favoritos", "🔔 Alertas", "📰 Notícias"])
+    t_an, t_fav, t_al, t_nt, t_cr = st.tabs(
+        ["Análise", "⭐ Favoritos", "🔔 Alertas", "📰 Notícias", "🪙 Cripto"])
     with t_an:
         if escolha:
             render_analise(escolha, periodo)
@@ -1013,8 +1052,9 @@ def main():
         render_alertas(dados, escolha, persistente)
     with t_nt:
         render_noticias(dados, escolha)
+    with t_cr:
+        render_cripto()
 
 
 if __name__ == "__main__":
     main()
-
