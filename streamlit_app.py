@@ -7,6 +7,7 @@ Ferramenta de apoio à pesquisa. Não é recomendação de compra ou venda.
 import datetime as dt
 import html
 import json
+import math
 import re
 import uuid
 import xml.etree.ElementTree as ET
@@ -417,7 +418,7 @@ TIPOS_ALERTA = {
 
 
 def _vazio():
-    return {"favoritos": [], "alertas": []}
+    return {"favoritos": [], "alertas": [], "carteira": [], "diario": []}
 
 
 def _config_gist():
@@ -439,6 +440,8 @@ def _ler_gist():
     dados = json.loads(arq.get("content") or "{}") if arq else {}
     dados.setdefault("favoritos", [])
     dados.setdefault("alertas", [])
+    dados.setdefault("carteira", [])
+    dados.setdefault("diario", [])
     return dados
 
 
@@ -1120,6 +1123,455 @@ def render_mercado_cripto():
                "Não é recomendação de compra ou venda.")
 
 
+# ------------------------------------------------------------ carteira e risco
+def fx_usdbrl():
+    r = resumo_ativo("USDBRL=X")
+    return r["preco"] if r else None
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def retorno_ibov(data_iso):
+    try:
+        h = yf.Ticker("^BVSP").history(start=data_iso)["Close"].dropna()
+        return (float(h.iloc[-1]) / float(h.iloc[0]) - 1) * 100 if len(h) >= 2 else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def retorno_cdi(data_iso):
+    """CDI acumulado desde a data (série 12 do Banco Central, % ao dia)."""
+    try:
+        ini, fim = dt.date.fromisoformat(data_iso), dt.date.today()
+        if ini >= fim:
+            return None
+        r = requests.get("https://api.bcb.gov.br/dados/serie/bcdata.sgs.12/dados", timeout=15,
+                         params={"formato": "json", "dataInicial": ini.strftime("%d/%m/%Y"),
+                                 "dataFinal": fim.strftime("%d/%m/%Y")})
+        r.raise_for_status()
+        fator = 1.0
+        for x in r.json():
+            fator *= 1 + float(x["valor"]) / 100
+        return (fator - 1) * 100
+    except Exception:
+        return None
+
+
+def atr_diario(simbolo):
+    h = carregar_historico(simbolo)
+    if h is None or h.empty or len(h) < 20:
+        return None
+    c = h["Close"]
+    tr = pd.concat([h["High"] - h["Low"], (h["High"] - c.shift()).abs(),
+                    (h["Low"] - c.shift()).abs()], axis=1).max(axis=1)
+    return float(tr.ewm(alpha=1 / 14, adjust=False).mean().iloc[-1])
+
+
+def eh_cripto(simbolo, tipo=None):
+    return tipo == "CRYPTOCURRENCY" or simbolo.endswith("-USD")
+
+
+# ---- posições
+def salvar_posicao():
+    ss = st.session_state
+    esc = ss.get("_escolha")
+    qtd, pm = float(ss.get("pos_qtd") or 0), float(ss.get("pos_pm") or 0)
+    if not esc or qtd <= 0 or pm <= 0:
+        ss["erro_salvar"] = "Escolha um ativo e informe quantidade e preço médio maiores que zero."
+        return
+    data = ss.get("pos_data") if ss.get("pos_usa_data") else None
+    pos = {"id": uuid.uuid4().hex[:8], "simbolo": esc["simbolo"], "nome": esc["nome"],
+           "lado": "short" if ss.get("pos_lado") == "Short" else "long",
+           "qtd": qtd, "pm": pm, "data": data.isoformat() if data else None}
+    mutar(lambda d: d.setdefault("carteira", []).append(pos))
+
+
+def remover_posicao():
+    id_ = st.session_state.get("pos_remover")
+    mutar(lambda d: d.update(carteira=[p for p in d.get("carteira", []) if p["id"] != id_]))
+
+
+def montar_carteira(carteira):
+    """Uma linha por posição, com resultado e exposição em R$ (dólar convertido pelo câmbio de hoje)."""
+    fx = fx_usdbrl()
+    linhas = []
+    for p in carteira:
+        r = resumo_ativo(p["simbolo"])
+        m = moeda_de(p["simbolo"])
+        f = 1.0 if m == "R$" else (fx or 1.0)
+        sinal = 1 if p["lado"] == "long" else -1
+        preco = r["preco"] if r else None
+        custo = p["pm"] * p["qtd"] * f
+        resultado = sinal * (preco - p["pm"]) * p["qtd"] * f if preco is not None else None
+        ibov = cdi = None
+        if p.get("data") and p["lado"] == "long":
+            ibov, cdi = retorno_ibov(p["data"]), retorno_cdi(p["data"])
+        linhas.append({
+            "id": p["id"], "Ativo": p["simbolo"], "Lado": "Long" if sinal == 1 else "Short",
+            "Moeda": m, "Qtd": p["qtd"], "Preço médio": p["pm"], "Preço atual": preco,
+            "Custo (R$)": custo,
+            "Exposição (R$)": preco * p["qtd"] * f if preco is not None else None,
+            "Resultado (R$)": resultado,
+            "Resultado (%)": resultado / custo * 100 if resultado is not None and custo else None,
+            "Ibovespa no período (%)": ibov, "CDI no período (%)": cdi,
+            "Desde": p.get("data") or "—", "Cripto": eh_cripto(p["simbolo"])})
+    df = pd.DataFrame(linhas)
+    if not df.empty:
+        total = df["Exposição (R$)"].sum()
+        df["Peso (%)"] = df["Exposição (R$)"] / total * 100 if total else None
+    return df, fx
+
+
+CONFIG_CARTEIRA = {
+    "Qtd": st.column_config.NumberColumn(format="%.6g"),
+    "Preço médio": st.column_config.NumberColumn(format="%.4f"),
+    "Preço atual": st.column_config.NumberColumn(format="%.4f"),
+    "Custo (R$)": st.column_config.NumberColumn(format="%.2f"),
+    "Exposição (R$)": st.column_config.NumberColumn(format="%.2f"),
+    "Resultado (R$)": st.column_config.NumberColumn(format="%+.2f"),
+    "Resultado (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+    "Peso (%)": st.column_config.NumberColumn(format="%.1f%%"),
+    "Ibovespa no período (%)": st.column_config.NumberColumn(format="%+.1f%%"),
+    "CDI no período (%)": st.column_config.NumberColumn(format="%+.1f%%"),
+}
+
+
+def render_carteira(dados, escolha):
+    carteira = dados.get("carteira", [])
+    st.markdown("### 💼 Carteira")
+    with st.expander("➕ Adicionar posição", expanded=not carteira):
+        if escolha:
+            st.write(f"Ativo: **{escolha['nome']}** ({escolha['simbolo']}), o escolhido na barra lateral.")
+        else:
+            st.info("Escolha um ativo na barra lateral para adicionar uma posição.")
+        st.radio("Lado", ["Long", "Short"], horizontal=True, key="pos_lado")
+        c1, c2 = st.columns(2)
+        c1.number_input("Quantidade", min_value=0.0, value=0.0, step=1.0, format="%.6g", key="pos_qtd")
+        c2.number_input("Preço médio de entrada", min_value=0.0, value=0.0, step=0.01,
+                        format="%.4f", key="pos_pm")
+        st.checkbox("Informar a data de entrada (para comparar com Ibovespa e CDI)", key="pos_usa_data")
+        if st.session_state.get("pos_usa_data"):
+            st.date_input("Data de entrada", value=dt.date.today(), max_value=dt.date.today(),
+                          key="pos_data")
+        st.button("Adicionar à carteira", on_click=salvar_posicao, type="primary", disabled=not escolha)
+        st.caption("Cada compra vira uma linha. Valores em dólar (cripto, ações dos EUA) são "
+                   "convertidos pelo câmbio de hoje.")
+
+    if not carteira:
+        st.info("Sua carteira está vazia. Adicione posições acima.")
+        return
+    df, fx = montar_carteira(carteira)
+    if fx is None and (df["Moeda"] == "US$").any():
+        st.warning("Não consegui o câmbio do dólar agora: valores em dólar aparecem sem conversão.")
+
+    custo, expo = df["Custo (R$)"].sum(), df["Exposição (R$)"].sum()
+    resultado = df["Resultado (R$)"].sum()
+    a, b, c = st.columns(3)
+    a.metric("Investido", f"R$ {br(custo)}")
+    b.metric("Exposição atual", f"R$ {br(expo)}")
+    c.metric("Resultado", f"R$ {br(resultado)}", f"{br(resultado / custo * 100) if custo else '0'}%")
+    mostrar = df.drop(columns=["id", "Cripto"])
+    st.dataframe(mostrar, column_config=CONFIG_CARTEIRA, hide_index=True, use_container_width=True)
+
+    por_ativo = df.groupby("Ativo")["Exposição (R$)"].sum()
+    if expo:
+        pesos = (por_ativo / expo * 100).sort_values(ascending=False)
+        st.markdown("#### Distribuição")
+        st.bar_chart(pesos.rename("Peso (%)"))
+        cripto_pct = df.loc[df["Cripto"], "Exposição (R$)"].sum() / expo * 100
+        st.caption(f"Cripto: {br(cripto_pct, 1)}% da exposição.")
+        if pesos.iloc[0] > 30:
+            st.warning(f"Concentração: {pesos.index[0]} é {br(pesos.iloc[0], 0)}% da carteira. "
+                       "Muitos investidores definem um teto por ativo; defina o seu.")
+    if df["Ibovespa no período (%)"].notna().any():
+        st.caption("Ibovespa e CDI: retorno acumulado desde a data de entrada de cada compra "
+                   "(só para posições long com data).")
+
+    st.selectbox("Remover posição", [p["id"] for p in carteira], key="pos_remover",
+                 format_func=lambda i: next(
+                     f"{p['simbolo']} · {p['lado']} · {br(p['qtd'], 4)} a {br(p['pm'])}"
+                     for p in carteira if p["id"] == i))
+    st.button("Remover", on_click=remover_posicao)
+    st.caption("Não é recomendação. Resultado não inclui custos, impostos nem dividendos.")
+
+
+# ---- diário de operações
+def salvar_operacao():
+    ss = st.session_state
+    esc = ss.get("_escolha")
+    ent, sai, qtd = (float(ss.get(k) or 0) for k in ("op_ent", "op_sai", "op_qtd"))
+    if not esc or ent <= 0 or sai <= 0 or qtd <= 0:
+        ss["erro_salvar"] = "Escolha um ativo e informe entrada, saída e quantidade maiores que zero."
+        return
+    stop = float(ss.get("op_stop") or 0)
+    op = {"id": uuid.uuid4().hex[:8], "simbolo": esc["simbolo"], "nome": esc["nome"],
+          "lado": "short" if ss.get("op_lado") == "Short" else "long", "entrada": ent,
+          "saida": sai, "qtd": qtd, "stop": stop if stop > 0 else None,
+          "data": (ss.get("op_data") or dt.date.today()).isoformat(),
+          "nota": (ss.get("op_nota") or "").strip()[:200]}
+    mutar(lambda d: d.setdefault("diario", []).append(op))
+
+
+def remover_operacao():
+    id_ = st.session_state.get("op_remover")
+    mutar(lambda d: d.update(diario=[o for o in d.get("diario", []) if o["id"] != id_]))
+
+
+def montar_diario(ops, fx):
+    linhas = []
+    for o in ops:
+        sinal = 1 if o["lado"] == "long" else -1
+        f = 1.0 if moeda_de(o["simbolo"]) == "R$" else (fx or 1.0)
+        res = sinal * (o["saida"] - o["entrada"]) * o["qtd"] * f
+        risco_un = (o["entrada"] - o["stop"]) * sinal if o.get("stop") else None
+        r = sinal * (o["saida"] - o["entrada"]) / risco_un if risco_un and risco_un > 0 else None
+        linhas.append({"id": o["id"], "Data": o["data"], "Ativo": o["simbolo"],
+                       "Lado": "Long" if sinal == 1 else "Short", "Entrada": o["entrada"],
+                       "Saída": o["saida"], "Qtd": o["qtd"], "Resultado (R$)": res, "R": r,
+                       "Nota": o.get("nota", "")})
+    return pd.DataFrame(linhas).sort_values("Data", kind="stable").reset_index(drop=True)
+
+
+def estatisticas_diario(df):
+    res = df["Resultado (R$)"]
+    n = len(df)
+    ganhos, perdas = res[res > 0], res[res < 0]
+    media_g = float(ganhos.mean()) if len(ganhos) else 0.0
+    media_p = float(perdas.mean()) if len(perdas) else 0.0
+    curva = res.cumsum()
+    com_zero = pd.concat([pd.Series([0.0]), curva], ignore_index=True)
+    dd = float((com_zero.cummax() - com_zero).max())
+    seq = atual = 0
+    for x in res:
+        atual = atual + 1 if x < 0 else 0
+        seq = max(seq, atual)
+    return {"n": n, "acerto": len(ganhos) / n * 100, "total": float(res.sum()),
+            "media_ganho": media_g, "media_perda": media_p,
+            "payoff": media_g / abs(media_p) if media_p else None,
+            "esperanca": float(res.mean()),
+            "esperanca_r": float(df["R"].dropna().mean()) if df["R"].notna().any() else None,
+            "seq_perdas": seq, "drawdown": dd, "curva": curva}
+
+
+# ---- backtest das regras (as mesmas do bot de sinais; só compra, gráfico diário)
+BT_SETUPS = {
+    "pullback": {"nome": "Pullback em tendência de alta", "stop_atr": 1.5, "alvos": (1.5, 3.0)},
+    "rompimento": {"nome": "Rompimento com volume", "stop_atr": 2.0, "alvos": (2.0, 4.0)},
+}
+BT_MAX_BARRAS = 20
+
+
+def bt_preparar(df):
+    d = df[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
+    c, h, l = d["Close"], d["High"], d["Low"]
+    d["SMA200"] = c.rolling(200).mean()
+    delta = c.diff()
+    mg = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    mp = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    d["RSI"] = 100 - 100 / (1 + mg / mp)
+    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+    d["ATR"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
+    d["VOLMM"] = d["Volume"].rolling(20).mean()
+    return d
+
+
+def bt_sinais(d):
+    tendencia = d["Close"] > d["SMA200"]
+    pullback = (tendencia & (d["RSI"].rolling(5).min() <= 40)
+                & (d["Close"] > d["High"].shift(1)))
+    rompimento = (tendencia & (d["Close"] > d["High"].shift(1).rolling(20).max())
+                  & (d["Volume"] > 1.5 * d["VOLMM"].shift(1)))
+    saida = {}
+    for nome, cond in (("pullback", pullback), ("rompimento", rompimento)):
+        cond = cond.fillna(False).astype(bool)
+        saida[nome] = cond & ~cond.shift(1, fill_value=False)
+    return saida
+
+
+def bt_simular(d, indices, nome):
+    """[(posição da entrada, resultado em R)]. Entrada na abertura do dia seguinte; metade sai
+    no alvo 1, metade no alvo 2; se stop e alvo caem no mesmo dia, vale o stop."""
+    s = BT_SETUPS[nome]
+    o, h, l, c = (d[k].values for k in ("Open", "High", "Low", "Close"))
+    atr = d["ATR"].values
+    resultados, livre = [], 0
+    for i in indices:
+        if i < livre or i + 1 >= len(d) or np.isnan(atr[i]) or atr[i] <= 0:
+            continue
+        entrada = o[i + 1]
+        risco = s["stop_atr"] * atr[i]
+        stop = entrada - risco
+        t1, t2 = entrada + s["alvos"][0] * risco, entrada + s["alvos"][1] * risco
+        resto, r, t1_ok = 1.0, 0.0, False
+        fim = min(i + BT_MAX_BARRAS, len(d) - 1)
+        saiu = fim
+        for j in range(i + 1, fim + 1):
+            if l[j] <= stop:
+                preco = min(o[j], stop) if j > i + 1 else stop
+                r += resto * (preco - entrada) / risco
+                resto, saiu = 0.0, j
+                break
+            if not t1_ok and h[j] >= t1:
+                r += 0.5 * s["alvos"][0]
+                resto, t1_ok = 0.5, True
+            if t1_ok and h[j] >= t2:
+                r += resto * s["alvos"][1]
+                resto, saiu = 0.0, j
+                break
+        if resto > 0:
+            r += resto * (c[fim] - entrada) / risco
+        resultados.append((i + 1, float(r)))
+        livre = saiu + 1
+    return resultados
+
+
+def render_risco(dados, escolha):
+    # ---------------- calculadora de posição
+    st.markdown("### 🛡️ Calculadora de posição")
+    if not escolha:
+        st.info("Escolha um ativo na barra lateral para usar o preço atual e o ATR dele.")
+    simbolo = escolha["simbolo"] if escolha else "MANUAL"
+    moeda = moeda_de(simbolo) if escolha else "R$"
+    r = resumo_ativo(simbolo) if escolha else None
+    c1, c2 = st.columns(2)
+    capital = c1.number_input("Capital total (R$)", min_value=0.0, value=10000.0, step=500.0,
+                              key="rk_capital")
+    risco_pct = c2.number_input("Risco por operação (% do capital)", min_value=0.1, max_value=10.0,
+                                value=1.0, step=0.1, key="rk_pct")
+    lado = st.radio("Lado", ["Long", "Short"], horizontal=True, key="rk_lado")
+    sinal = 1 if lado == "Long" else -1
+    base = round(float(r["preco"]), 4) if r else 0.0
+    entrada = st.number_input(f"Preço de entrada ({moeda})", min_value=0.0, value=base,
+                              step=0.01, format="%.4f", key=f"rk_ent_{simbolo}")
+    atr = atr_diario(simbolo) if escolha else None
+    modos = ["Informar o preço do stop"] + (["Usar ATR do ativo (gráfico diário)"] if atr else [])
+    modo = st.radio("Stop", modos, key="rk_modo")
+    if modo.startswith("Usar ATR"):
+        k = st.number_input("Distância do stop (em ATR)", min_value=0.5, max_value=6.0, value=1.5,
+                            step=0.1, key="rk_k")
+        stop = entrada - sinal * k * atr
+        st.caption(f"ATR(14) diário: {moeda} {br(atr, 4)} → stop em {moeda} {br(stop, 4)}")
+    else:
+        stop = st.number_input(f"Preço do stop ({moeda})", min_value=0.0,
+                               value=round(entrada * (1 - 0.03 * sinal), 4), step=0.01,
+                               format="%.4f", key=f"rk_stop_{simbolo}_{lado}")
+    dist = (entrada - stop) * sinal
+    if entrada <= 0 or dist <= 0:
+        st.error("O stop precisa ficar abaixo da entrada (long) ou acima dela (short).")
+    else:
+        fx = fx_usdbrl() if moeda == "US$" else 1.0
+        f = fx or 1.0
+        if moeda == "US$" and fx is None:
+            st.warning("Sem o câmbio do dólar agora: tratando R$ e US$ como iguais.")
+        risco_brl = capital * risco_pct / 100
+        bruto = (risco_brl / f) / dist
+        qtd = math.floor(bruto * 1e6) / 1e6 if eh_cripto(simbolo) else math.floor(bruto)
+        valor_brl = qtd * entrada * f
+        perda_brl = qtd * dist * f
+        a, b, c = st.columns(3)
+        a.metric("Quantidade máxima", br(qtd, 6 if eh_cripto(simbolo) else 0))
+        b.metric("Valor da posição", f"R$ {br(valor_brl)}",
+                 f"{br(valor_brl / capital * 100, 1) if capital else '0'}% do capital", delta_color="off")
+        c.metric("Perda se o stop for atingido", f"R$ {br(perda_brl)}",
+                 f"{br(perda_brl / capital * 100, 2) if capital else '0'}% do capital", delta_color="off")
+        if qtd <= 0:
+            st.warning("Com esse risco e esse stop, não dá para comprar nem 1 unidade. "
+                       "Aumente o risco, o capital ou aproxime o stop.")
+        if capital and valor_brl > capital:
+            st.warning("A posição é maior que o capital: exigiria alavancagem. Confira os riscos "
+                       "e as regras da sua corretora.")
+        elif capital and valor_brl > capital * 0.3:
+            st.warning("A posição passa de 30% do capital. Concentração alta em um ativo só.")
+        alvos = [{"Alvo (risco/retorno)": f"1:{br(m, 1)}",
+                  f"Preço ({moeda})": entrada + sinal * m * dist,
+                  "Variação (%)": sinal * m * dist / entrada * 100,
+                  "Resultado (R$)": qtd * m * dist * f} for m in (1.0, 1.5, 2.0, 3.0)]
+        st.dataframe(pd.DataFrame(alvos), hide_index=True, use_container_width=True,
+                     column_config={f"Preço ({moeda})": st.column_config.NumberColumn(format="%.4f"),
+                                    "Variação (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                                    "Resultado (R$)": st.column_config.NumberColumn(format="%+.2f")})
+        st.caption("Quantidade = risco em R$ ÷ distância até o stop. Não inclui custos nem "
+                   "derrapagem (preço pior que o stop). Ações da B3 podem exigir lote de 100 "
+                   "(ou fracionário).")
+
+    # ---------------- diário de operações
+    st.markdown("### 📓 Diário de operações")
+    ops = dados.get("diario", [])
+    with st.expander("➕ Registrar operação encerrada", expanded=not ops):
+        if escolha:
+            st.write(f"Ativo: **{escolha['nome']}** ({escolha['simbolo']}), o escolhido na barra lateral.")
+        st.radio("Lado", ["Long", "Short"], horizontal=True, key="op_lado")
+        d1, d2, d3 = st.columns(3)
+        d1.number_input("Entrada", min_value=0.0, value=0.0, step=0.01, format="%.4f", key="op_ent")
+        d2.number_input("Saída", min_value=0.0, value=0.0, step=0.01, format="%.4f", key="op_sai")
+        d3.number_input("Quantidade", min_value=0.0, value=0.0, step=1.0, format="%.6g", key="op_qtd")
+        e1, e2 = st.columns(2)
+        e1.number_input("Stop inicial (opcional, para calcular o R)", min_value=0.0, value=0.0,
+                        step=0.01, format="%.4f", key="op_stop")
+        e2.date_input("Data da saída", value=dt.date.today(), max_value=dt.date.today(), key="op_data")
+        st.text_input("Nota (opcional)", max_chars=200, key="op_nota")
+        st.button("Salvar operação", on_click=salvar_operacao, type="primary", disabled=not escolha)
+    if not ops:
+        st.caption("Nenhuma operação registrada ainda.")
+    else:
+        df = montar_diario(ops, fx_usdbrl())
+        est = estatisticas_diario(df)
+        a, b, c = st.columns(3)
+        a.metric("Operações", est["n"], f"{br(est['acerto'], 0)}% positivas", delta_color="off")
+        b.metric("Resultado total", f"R$ {br(est['total'])}")
+        c.metric("Expectativa por operação", f"R$ {br(est['esperanca'])}",
+                 f"{br(est['esperanca_r'])}R" if est["esperanca_r"] is not None else None,
+                 delta_color="off")
+        a2, b2, c2 = st.columns(3)
+        a2.metric("Ganho médio", f"R$ {br(est['media_ganho'])}")
+        b2.metric("Perda média", f"R$ {br(est['media_perda'])}")
+        c2.metric("Payoff", br(est["payoff"]) if est["payoff"] is not None else "—")
+        st.caption(f"Pior sequência de perdas: {est['seq_perdas']} · maior queda da curva: "
+                   f"R$ {br(est['drawdown'])}")
+        st.line_chart(est["curva"].rename("Resultado acumulado (R$)"))
+        st.dataframe(df.drop(columns=["id"]), hide_index=True, use_container_width=True,
+                     column_config={"Resultado (R$)": st.column_config.NumberColumn(format="%+.2f"),
+                                    "R": st.column_config.NumberColumn(format="%+.2f")})
+        st.selectbox("Remover operação", [o["id"] for o in ops], key="op_remover",
+                     format_func=lambda i: next(
+                         f"{o['data']} · {o['simbolo']} · {o['lado']}" for o in ops if o["id"] == i))
+        st.button("Remover", key="rm_op", on_click=remover_operacao)
+        st.caption("Valores em dólar usam o câmbio de hoje. Registrar tudo, inclusive os prejuízos, "
+                   "é o que torna as estatísticas úteis.")
+
+    # ---------------- backtest
+    st.markdown("### 🧪 Testar as regras no histórico")
+    if not escolha:
+        st.info("Escolha um ativo na barra lateral.")
+        return
+    nome_setup = st.selectbox("Regra", list(BT_SETUPS), key="bt_regra",
+                              format_func=lambda k: BT_SETUPS[k]["nome"])
+    hist = carregar_historico(escolha["simbolo"])
+    if hist is None or hist.empty or len(hist) < 260:
+        st.info("Histórico curto demais para testar.")
+        return
+    d = bt_preparar(hist)
+    idx = np.flatnonzero(bt_sinais(d)[nome_setup].values)
+    res = bt_simular(d, idx, nome_setup)
+    if not res:
+        st.info("Essa regra não gerou nenhuma operação nesse ativo no período.")
+    else:
+        rs = pd.Series([x for _, x in res])
+        a, b, c = st.columns(3)
+        a.metric("Operações", len(rs), f"{br((rs > 0).mean() * 100, 0)}% positivas", delta_color="off")
+        b.metric("Média por operação", f"{br(rs.mean())}R")
+        c.metric("Total", f"{br(rs.sum(), 1)}R")
+        s = BT_SETUPS[nome_setup]
+        st.line_chart(pd.Series(rs.cumsum().values,
+                                index=[d.index[i] for i, _ in res], name="Resultado acumulado (R)"))
+        st.caption(
+            f"Regra: {s['nome']}. Só compra, gráfico diário, ~{br(len(d) / 252, 1)} anos de dados. "
+            f"Stop = {br(s['stop_atr'], 1)} x ATR; metade sai em {br(s['alvos'][0], 1)}R e metade "
+            f"em {br(s['alvos'][1], 1)}R; sai no fechamento após {BT_MAX_BARRAS} pregões. "
+            "1R = o risco da operação. Sem corretagem, spread nem impostos; se stop e alvo caem "
+            "no mesmo dia, vale o stop. Passado não garante o futuro.")
+
+
 # --------------------------------------------------------------------- app
 def render_analise(escolha, periodo):
     ticker = escolha["simbolo"]
@@ -1428,9 +1880,10 @@ def main():
                    f"{m} {br(r['preco'])} · {TIPOS_ALERTA[a['tipo']]} "
                    + (br(a['valor'], 0) if a['tipo'] == 'rsi_abaixo' else f"{m} {br(a['valor'])}"))
 
-    t_an, t_fav, t_b3, t_mc, t_al, t_nt, t_cr = st.tabs(
-        ["Análise", "⭐ Favoritos", "📊 B3 hoje", "🪙 Mercado cripto", "🔔 Alertas",
-         "📰 Notícias", "📰 Notícias cripto"])
+    st.session_state["_escolha"] = escolha
+    t_an, t_fav, t_ca, t_rk, t_b3, t_mc, t_al, t_nt, t_cr = st.tabs(
+        ["Análise", "⭐ Favoritos", "💼 Carteira", "🛡️ Risco", "📊 B3 hoje", "🪙 Mercado cripto",
+         "🔔 Alertas", "📰 Notícias", "📰 Notícias cripto"])
     with t_an:
         if escolha:
             render_analise(escolha, periodo)
@@ -1438,6 +1891,10 @@ def main():
             st.info("Digite o nome ou código de um ativo na barra lateral.")
     with t_fav:
         render_favoritos(dados)
+    with t_ca:
+        render_carteira(dados, escolha)
+    with t_rk:
+        render_risco(dados, escolha)
     with t_b3:
         render_b3_hoje(dados)
     with t_mc:
