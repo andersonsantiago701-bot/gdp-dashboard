@@ -937,6 +937,189 @@ def render_sobre(escolha, info, cripto, moeda_simbolo):
                    "Máxima e mínima são preços nominais. Passado não garante o futuro.")
 
 
+# ------------------------------------------------- maiores altas e baixas (B3)
+# Universo: ações líquidas da B3. A lista muda com o tempo (trocas de código, saídas
+# da bolsa); códigos que não existirem mais são ignorados. Edite à vontade.
+UNIVERSO_B3 = [
+    "ABEV3", "ALOS3", "ALPA4", "AMBP3", "ARZZ3", "ASAI3", "AURE3", "AZZA3", "B3SA3",
+    "BBAS3", "BBDC3", "BBDC4", "BBSE3", "BEEF3", "BHIA3", "BPAC11", "BRAP4", "BRAV3",
+    "BRFS3", "BRKM5", "CASH3", "CEAB3", "CMIG4", "CMIN3", "COGN3", "CPFE3", "CPLE6",
+    "CRFB3", "CSAN3", "CSMG3", "CSNA3", "CURY3", "CVCB3", "CXSE3", "CYRE3", "DIRR3",
+    "DXCO3", "ELET3", "ELET6", "EMBR3", "ENEV3", "ENGI11", "EQTL3", "EZTC3", "FLRY3",
+    "GGBR4", "GMAT3", "GOAU4", "HAPV3", "HYPE3", "IGTI11", "IRBR3", "ITSA4", "ITUB4",
+    "JBSS3", "JHSF3", "KEPL3", "KLBN11", "LREN3", "LWSA3", "MEAL3", "MGLU3", "MILS3",
+    "MOTV3", "MRFG3", "MRVE3", "MULT3", "NATU3", "NGRD3", "ODPV3", "ONCO3", "PCAR3",
+    "PETR3", "PETR4", "PETZ3", "PLPL3", "POMO4", "PRIO3", "QUAL3", "RADL3", "RAIL3",
+    "RAIZ4", "RAPT4", "RDOR3", "RECV3", "RENT3", "SANB11", "SAPR11", "SBSP3", "SEER3",
+    "SIMH3", "SLCE3", "SMFT3", "SMTO3", "STBP3", "SUZB3", "TAEE11", "TEND3", "TIMS3",
+    "TOTS3", "TRPL4", "TUPY3", "UGPA3", "USIM5", "VALE3", "VAMO3", "VBBR3", "VIVA3",
+    "VIVT3", "VLID3", "WEGE3", "YDUQ3", "ZAMP3",
+]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def variacoes_b3(tickers):
+    """Variação do dia de cada ação (último fechamento ou preço atual vs. fechamento anterior)."""
+    def uma(t):
+        try:
+            h = yf.Ticker(t + ".SA").history(period="5d").dropna(subset=["Close"])
+            if len(h) < 2:
+                return None
+            u, a = h.iloc[-1], h.iloc[-2]
+            return {"Código": t, "Preço (R$)": float(u["Close"]),
+                    "Variação (%)": (float(u["Close"]) / float(a["Close"]) - 1) * 100,
+                    "Volume (R$ mi)": float(u["Close"]) * float(u["Volume"]) / 1e6,
+                    "Data": h.index[-1].date()}
+        except Exception:
+            return None
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        res = [r for r in ex.map(uma, tickers) if r]
+    if not res:
+        return pd.DataFrame()
+    df = pd.DataFrame(res)
+    return df[df["Data"] == df["Data"].max()].reset_index(drop=True)  # tira papéis sem negócio hoje
+
+
+def ranking_altas_baixas(df, vol_min, n=20):
+    d = df[df["Volume (R$ mi)"] >= vol_min].drop(columns=["Data"])
+    altas = d.sort_values("Variação (%)", ascending=False).head(n).reset_index(drop=True)
+    baixas = d.sort_values("Variação (%)", ascending=True).head(n).reset_index(drop=True)
+    for t in (altas, baixas):
+        t.index = t.index + 1
+    return altas, baixas, len(d)
+
+
+CONFIG_B3 = {
+    "Preço (R$)": st.column_config.NumberColumn(format="%.2f"),
+    "Variação (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+    "Volume (R$ mi)": st.column_config.NumberColumn(format="%.1f"),
+}
+
+
+def render_b3_hoje(dados):
+    topo1, topo2 = st.columns([3, 1])
+    topo1.caption("Variação do dia das ações líquidas da B3. Dados do Yahoo, com atraso de alguns "
+                  "minutos; atualiza a cada 5 minutos.")
+    if topo2.button("🔄 Atualizar", key="atualizar_b3"):
+        variacoes_b3.clear()
+    vol_min = st.slider("Volume financeiro mínimo do dia (R$ milhões)", 0.0, 100.0, 2.0, 0.5,
+                        help="Filtra papéis com pouca negociação, que costumam distorcer o ranking.")
+    extras = [f["simbolo"][:-3] for f in dados["favoritos"] if f["simbolo"].endswith(".SA")]
+    universo = tuple(dict.fromkeys(UNIVERSO_B3 + extras))
+    with st.spinner("Buscando as cotações da B3..."):
+        df = variacoes_b3(universo)
+    if df.empty:
+        st.info("Não consegui carregar as cotações agora. Tente atualizar em instantes.")
+        return
+    altas, baixas, n = ranking_altas_baixas(df, vol_min)
+    st.caption(f"Pregão de {df['Data'].max():%d/%m/%Y} · {n} ações analisadas "
+               f"(de {len(universo)} da lista).")
+    st.markdown("#### 📈 20 maiores altas do dia")
+    st.dataframe(altas, column_config=CONFIG_B3, use_container_width=True)
+    st.markdown("#### 📉 20 maiores baixas do dia")
+    st.dataframe(baixas, column_config=CONFIG_B3, use_container_width=True)
+    st.caption("O universo é uma lista fixa de ações líquidas, não toda a bolsa. Para analisar um "
+               "papel, busque o código na barra lateral. Não é recomendação de compra ou venda.")
+
+
+# ---------------------------------------------------------------- mercado cripto
+@st.cache_data(ttl=300, show_spinner=False)
+def cripto_mercado(moeda):
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/coins/markets", headers=UA, timeout=15,
+                         params={"vs_currency": moeda, "order": "market_cap_desc", "per_page": 100,
+                                 "page": 1, "sparkline": "false",
+                                 "price_change_percentage": "1h,24h,7d"})
+        r.raise_for_status()
+        linhas = []
+        for c in r.json():
+            def v(chave):
+                x = c.get(f"price_change_percentage_{chave}_in_currency")
+                return c.get(f"price_change_percentage_{chave}") if x is None else x
+            linhas.append({
+                "#": c.get("market_cap_rank"), "Nome": c.get("name"),
+                "Símbolo": (c.get("symbol") or "").upper(),
+                f"Preço ({'R$' if moeda == 'brl' else 'US$'})": c.get("current_price"),
+                "1h (%)": v("1h"), "24h (%)": v("24h"), "7d (%)": v("7d"),
+                "Volume 24h (mi)": (c.get("total_volume") or 0) / 1e6,
+                "Valor de mercado (bi)": (c.get("market_cap") or 0) / 1e9})
+        return pd.DataFrame(linhas)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cripto_global():
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/global", headers=UA, timeout=10)
+        r.raise_for_status()
+        d = r.json().get("data", {})
+        return {"total_usd": d.get("total_market_cap", {}).get("usd"),
+                "var24": d.get("market_cap_change_percentage_24h_usd"),
+                "btc": d.get("market_cap_percentage", {}).get("btc"),
+                "eth": d.get("market_cap_percentage", {}).get("eth")}
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def medo_ganancia():
+    try:
+        r = requests.get("https://api.alternative.me/fng/", headers=UA, timeout=10)
+        r.raise_for_status()
+        d = r.json()["data"][0]
+        nomes = {"Extreme Fear": "Medo extremo", "Fear": "Medo", "Neutral": "Neutro",
+                 "Greed": "Ganância", "Extreme Greed": "Ganância extrema"}
+        return int(d["value"]), nomes.get(d.get("value_classification"), d.get("value_classification"))
+    except Exception:
+        return None
+
+
+def render_mercado_cripto():
+    topo1, topo2 = st.columns([3, 1])
+    topo1.caption("As 100 maiores criptomoedas por valor de mercado (CoinGecko). Atualiza a cada 5 minutos.")
+    if topo2.button("🔄 Atualizar", key="atualizar_mc"):
+        cripto_mercado.clear(); cripto_global.clear(); medo_ganancia.clear()
+    moeda = "brl" if st.radio("Moeda", ["US$ (dólar)", "R$ (real)"], horizontal=True,
+                              key="moeda_cripto").startswith("R$") else "usd"
+    df = cripto_mercado(moeda)
+    if df.empty:
+        st.info("Não consegui carregar o mercado cripto agora (a fonte gratuita limita acessos). "
+                "Tente atualizar em um minuto.")
+        return
+
+    g, fg = cripto_global(), medo_ganancia()
+    a, b, c = st.columns(3)
+    if g and g["total_usd"]:
+        a.metric("Valor de mercado total", f"US$ {br(g['total_usd'] / 1e12, 2)} tri",
+                 f"{br(g['var24'])}% em 24h" if g["var24"] is not None else None)
+        b.metric("Dominância", f"BTC {br(g['btc'], 1)}%", f"ETH {br(g['eth'], 1)}%", delta_color="off")
+    if fg:
+        c.metric("Medo e Ganância", f"{fg[0]}/100", fg[1], delta_color="off")
+
+    preco_col = [x for x in df.columns if x.startswith("Preço")][0]
+    config = {
+        preco_col: st.column_config.NumberColumn(format="%.4f"),
+        "1h (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+        "24h (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+        "7d (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+        "Volume 24h (mi)": st.column_config.NumberColumn(format="%.0f"),
+        "Valor de mercado (bi)": st.column_config.NumberColumn(format="%.2f"),
+    }
+    com24 = df.dropna(subset=["24h (%)"])
+    cols = ["Nome", "Símbolo", preco_col, "24h (%)", "7d (%)"]
+    st.markdown("#### 🚀 10 maiores altas em 24h (entre as 100 maiores)")
+    st.dataframe(com24.sort_values("24h (%)", ascending=False).head(10)[cols].reset_index(drop=True),
+                 column_config=config, hide_index=True, use_container_width=True)
+    st.markdown("#### 🔻 10 maiores baixas em 24h (entre as 100 maiores)")
+    st.dataframe(com24.sort_values("24h (%)").head(10)[cols].reset_index(drop=True),
+                 column_config=config, hide_index=True, use_container_width=True)
+    st.markdown("#### Top 100 por valor de mercado")
+    st.dataframe(df, column_config=config, hide_index=True, use_container_width=True)
+    st.caption("Criptomoedas são muito voláteis. Os dados vêm de fontes gratuitas e podem atrasar. "
+               "Não é recomendação de compra ou venda.")
+
+
 # --------------------------------------------------------------------- app
 def render_analise(escolha, periodo):
     ticker = escolha["simbolo"]
@@ -1245,8 +1428,9 @@ def main():
                    f"{m} {br(r['preco'])} · {TIPOS_ALERTA[a['tipo']]} "
                    + (br(a['valor'], 0) if a['tipo'] == 'rsi_abaixo' else f"{m} {br(a['valor'])}"))
 
-    t_an, t_fav, t_al, t_nt, t_cr = st.tabs(
-        ["Análise", "⭐ Favoritos", "🔔 Alertas", "📰 Notícias", "🪙 Cripto"])
+    t_an, t_fav, t_b3, t_mc, t_al, t_nt, t_cr = st.tabs(
+        ["Análise", "⭐ Favoritos", "📊 B3 hoje", "🪙 Mercado cripto", "🔔 Alertas",
+         "📰 Notícias", "📰 Notícias cripto"])
     with t_an:
         if escolha:
             render_analise(escolha, periodo)
@@ -1254,6 +1438,10 @@ def main():
             st.info("Digite o nome ou código de um ativo na barra lateral.")
     with t_fav:
         render_favoritos(dados)
+    with t_b3:
+        render_b3_hoje(dados)
+    with t_mc:
+        render_mercado_cripto()
     with t_al:
         render_alertas(dados, escolha, persistente)
     with t_nt:
