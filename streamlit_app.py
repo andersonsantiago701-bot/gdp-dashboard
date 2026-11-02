@@ -7,11 +7,12 @@ Ferramenta de apoio à pesquisa. Não é recomendação de compra ou venda.
 import datetime as dt
 import html
 import json
+import re
 import uuid
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from email.utils import parsedate_to_datetime
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
 
 import numpy as np
 import pandas as pd
@@ -735,6 +736,207 @@ def render_cripto():
                "Confira a fonte antes de tomar qualquer decisão.")
 
 
+# ------------------------------------------------------------ sobre o ativo
+UA = {"User-Agent": "Santinvest/1.0 (app de analise de ativos)"}
+
+
+def nome_curto(nome):
+    """'Petróleo Brasileiro S.A. - Petrobras' -> 'Petrobras'."""
+    nome = (nome or "").strip()
+    if " - " in nome:
+        nome = nome.split(" - ")[-1].strip()
+    for sufixo in (" USD", " S.A.", " SA", " Inc.", " Inc", " Corporation", " Corp."):
+        if nome.endswith(sufixo):
+            nome = nome[: -len(sufixo)].strip()
+    return nome
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def wiki_buscar(consulta):
+    try:
+        r = requests.get("https://pt.wikipedia.org/w/rest.php/v1/search/page",
+                         params={"q": consulta, "limit": 4}, headers=UA, timeout=10)
+        r.raise_for_status()
+        return [{"titulo": p["title"], "chave": p["key"], "descricao": p.get("description") or ""}
+                for p in r.json().get("pages", [])]
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def wiki_texto(chave):
+    """Texto completo do artigo, em texto simples, com títulos de seção marcados com ==."""
+    try:
+        r = requests.get("https://pt.wikipedia.org/w/api.php", headers=UA, timeout=15, params={
+            "action": "query", "prop": "extracts", "explaintext": 1, "exsectionformat": "wiki",
+            "redirects": 1, "titles": chave.replace("_", " "), "format": "json"})
+        r.raise_for_status()
+        paginas = r.json().get("query", {}).get("pages", {})
+        for p in paginas.values():
+            return p.get("extract") or ""
+    except Exception:
+        pass
+    return ""
+
+
+def separar_wiki(texto):
+    """Devolve (introdução, texto da seção de história ou '')."""
+    if not texto:
+        return "", ""
+    partes = re.split(r"(?m)^==\s*([^=].*?)\s*==\s*$", texto)
+    intro = partes[0].strip()
+    historia = ""
+    for i in range(1, len(partes) - 1, 2):
+        if partes[i].lower().startswith(("hist", "orige", "fundaç", "fundac")):
+            historia = partes[i + 1].strip()
+            break
+    return intro, historia
+
+
+def limpar_wiki(texto, limite):
+    texto = re.sub(r"(?m)^=+\s*(.*?)\s*=+\s*$", r"**\1**", texto)
+    if len(texto) > limite:
+        corte = texto[:limite]
+        ponto = corte.rfind(". ")
+        texto = (corte[: ponto + 1] if ponto > limite * 0.5 else corte) + " …"
+    return texto.replace("$", "\\$").replace("\n", "\n\n")
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def coingecko_info(simbolo):
+    base = simbolo.split("-")[0].lower()
+    try:
+        s = requests.get("https://api.coingecko.com/api/v3/search", params={"query": base},
+                         headers=UA, timeout=10)
+        s.raise_for_status()
+        cand = [m for m in s.json().get("coins", []) if (m.get("symbol") or "").lower() == base]
+        if not cand:
+            return None
+        cand.sort(key=lambda m: m.get("market_cap_rank") or 10 ** 9)
+        j = requests.get(f"https://api.coingecko.com/api/v3/coins/{cand[0]['id']}", headers=UA,
+                         timeout=10, params={"localization": "false", "tickers": "false",
+                                             "market_data": "false", "community_data": "false",
+                                             "developer_data": "false"})
+        j.raise_for_status()
+        j = j.json()
+        site = next((u for u in (j.get("links", {}).get("homepage") or []) if u), None)
+        return {
+            "nome": j.get("name"), "ranking": j.get("market_cap_rank"),
+            "lancamento": j.get("genesis_date"), "algoritmo": j.get("hashing_algorithm"),
+            "categorias": [c for c in (j.get("categories") or []) if c][:6], "site": site,
+            "descricao": (j.get("description") or {}).get("en", "")}
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def trajetoria(ticker):
+    try:
+        h = yf.Ticker(ticker).history(period="max", auto_adjust=False)
+    except Exception:
+        return None
+    if h is None or h.empty:
+        return None
+    h.index = h.index.tz_localize(None)
+    ajust = h["Adj Close"] if "Adj Close" in h.columns else h["Close"]
+    ajust = ajust.dropna()
+    ultimo_dia = ajust.index[-1]
+    retornos = {}
+    for anos in (1, 3, 5, 10):
+        alvo = ultimo_dia - pd.DateOffset(years=anos)
+        antes = ajust[ajust.index <= alvo]
+        if not antes.empty:
+            retornos[anos] = (float(ajust.iloc[-1]) / float(antes.iloc[-1]) - 1) * 100
+    return {
+        "inicio": h.index[0].date(),
+        "maxima": float(h["High"].max()), "data_maxima": h["High"].idxmax().date(),
+        "minima": float(h["Low"].min()), "data_minima": h["Low"].idxmin().date(),
+        "retornos": retornos}
+
+
+def render_sobre(escolha, info, cripto, moeda_simbolo):
+    ticker = escolha["simbolo"]
+    nome = info.get("longName") or info.get("shortName") or escolha["nome"]
+    st.markdown(f"### Sobre {nome_curto(nome) or ticker}")
+
+    # ---- ficha
+    local = ", ".join(x for x in (info.get("city"), info.get("state"), info.get("country")) if x)
+    func = info.get("fullTimeEmployees")
+    ficha = [("Código", ticker), ("Tipo", {"EQUITY": "Ação", "ETF": "ETF/FII",
+                                          "CRYPTOCURRENCY": "Criptomoeda", "INDEX": "Índice"}
+                                         .get(info.get("quoteType") or escolha["tipo"], "—")),
+             ("Setor", info.get("sector") or "—"), ("Indústria", info.get("industry") or "—"),
+             ("Sede", local or "—"),
+             ("Funcionários", br(float(func), 0) if isinstance(func, (int, float)) else "—"),
+             ("Bolsa", info.get("fullExchangeName") or info.get("exchange") or "—"),
+             ("Site", info.get("website") or "—")]
+    ficha = [(k, v) for k, v in ficha if v != "—"] or ficha[:1]
+    st.dataframe(pd.DataFrame(ficha, columns=["Campo", "Informação"]), hide_index=True,
+                 use_container_width=True)
+
+    # ---- cripto: CoinGecko
+    if cripto:
+        cg = coingecko_info(ticker)
+        if cg:
+            linhas = [("Nome", cg["nome"]), ("Ranking por valor de mercado", cg["ranking"]),
+                      ("Data de lançamento", cg["lancamento"]), ("Algoritmo", cg["algoritmo"]),
+                      ("Categorias", ", ".join(cg["categorias"]) or None), ("Site", cg["site"])]
+            st.markdown("#### Sobre a criptomoeda")
+            st.dataframe(pd.DataFrame([(k, str(v)) for k, v in linhas if v],
+                                      columns=["Campo", "Informação"]),
+                         hide_index=True, use_container_width=True)
+            if cg["descricao"]:
+                with st.expander("Descrição do projeto (CoinGecko, em inglês)"):
+                    st.markdown(re.sub(r"<[^>]+>", "", cg["descricao"]).replace("$", "\\$")[:2500])
+
+    # ---- Wikipédia: o que é e história
+    st.markdown("#### O que é e história")
+    padrao = nome_curto(nome) or ticker.split(".")[0]
+    consulta = st.text_input("Buscar na Wikipédia", value=padrao, key=f"wiki_{ticker}",
+                             help="Se a página não for a do ativo, ajuste o nome e tente de novo.")
+    paginas = wiki_buscar(consulta) if consulta.strip() else []
+    if not paginas:
+        st.info("Não encontrei uma página na Wikipédia para esse nome. Tente outro termo.")
+    else:
+        i = st.selectbox("Página", range(len(paginas)), key=f"wikipg_{ticker}",
+                         format_func=lambda k: paginas[k]["titulo"]
+                         + (f" — {paginas[k]['descricao']}" if paginas[k]["descricao"] else ""))
+        pg = paginas[i]
+        intro, historia = separar_wiki(wiki_texto(pg["chave"]))
+        if intro:
+            st.markdown(limpar_wiki(intro, 1800))
+        else:
+            st.info("A página não tem texto de introdução.")
+        if historia:
+            with st.expander("História"):
+                st.markdown(limpar_wiki(historia, 4000))
+        st.caption(f"Fonte: [Wikipédia]({'https://pt.wikipedia.org/wiki/' + quote(pg['chave'])}) "
+                   "(CC BY-SA 4.0). Confira se a página é mesmo do ativo; o texto pode estar "
+                   "desatualizado ou ter imprecisões.")
+
+    # ---- resumo oficial do Yahoo
+    if info.get("longBusinessSummary"):
+        with st.expander("Resumo da empresa (Yahoo Finance, em inglês)"):
+            st.markdown(info["longBusinessSummary"].replace("$", "\\$"))
+
+    # ---- trajetória de preço
+    tr = trajetoria(ticker)
+    if tr:
+        st.markdown("#### Trajetória de preço")
+        a, b, c = st.columns(3)
+        a.metric("Primeira cotação no Yahoo", f"{tr['inicio']:%d/%m/%Y}")
+        b.metric("Máxima histórica", f"{moeda_simbolo} {br(tr['maxima'])}",
+                 f"{tr['data_maxima']:%d/%m/%Y}", delta_color="off")
+        c.metric("Mínima histórica", f"{moeda_simbolo} {br(tr['minima'])}",
+                 f"{tr['data_minima']:%d/%m/%Y}", delta_color="off")
+        if tr["retornos"]:
+            st.dataframe(pd.DataFrame(
+                [{"Período": f"{a} ano{'s' if a > 1 else ''}", "Retorno": pct(v)}
+                 for a, v in tr["retornos"].items()]), hide_index=True, use_container_width=True)
+        st.caption("Retornos incluem dividendos reinvestidos, quando o Yahoo informa. "
+                   "Máxima e mínima são preços nominais. Passado não garante o futuro.")
+
+
 # --------------------------------------------------------------------- app
 def render_analise(escolha, periodo):
     ticker = escolha["simbolo"]
@@ -783,8 +985,9 @@ def render_analise(escolha, periodo):
     fund = None if cripto else avaliar_fundamentos(
         info, dividend_yield_12m(divs, preco))
 
-    aba_res, aba_graf, aba_fund, aba_tend, aba_mom = st.tabs(
-        ["Resumo", "Gráficos", "Fundamentos", "Tendência e médias", "Momento de compra"])
+    aba_res, aba_sobre, aba_graf, aba_fund, aba_tend, aba_mom = st.tabs(
+        ["Resumo", "Sobre o ativo", "Gráficos", "Fundamentos", "Tendência e médias",
+         "Momento de compra"])
 
     with aba_res:
         a, b, c = st.columns(3)
@@ -810,6 +1013,9 @@ def render_analise(escolha, periodo):
                 f"Preço-alvo médio dos analistas (Yahoo): {simbolo} {br(alvo)} "
                 f"({br((alvo / preco - 1) * 100, 1)}% vs. preço atual). "
                 "Projeções de analistas costumam errar e variam bastante.")
+
+    with aba_sobre:
+        render_sobre(escolha, info, cripto, simbolo)
 
     with aba_graf:
         st.plotly_chart(grafico_principal(visivel), use_container_width=True)
