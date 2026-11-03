@@ -277,23 +277,17 @@ def avaliar_momento(d):
 
     total = sum(p for _, p, _ in sinais)
     maximo = 7
-    if total >= 4:
-        veredito = "Favorável"
-    elif total >= 1:
-        veredito = "Levemente favorável"
-    elif total >= -1:
-        veredito = "Neutro"
-    elif total >= -3:
-        veredito = "Cautela"
-    else:
-        veredito = "Desfavorável"
+    altas = sum(1 for _, p, _ in sinais if p > 0)
+    baixas = sum(1 for _, p, _ in sinais if p < 0)
+    neutros = len(sinais) - altas - baixas
 
     janela = d.tail(60)
     return {
         "sinais": sinais,
         "total": total,
         "maximo": maximo,
-        "veredito": veredito,
+        "leitura": f"{altas} de alta · {baixas} de baixa · {neutros} neutros",
+        "curto": f"{altas}↑ {baixas}↓ {neutros}→",
         "suporte": janela["Low"].min(),
         "resistencia": janela["High"].max(),
         "bb_inf": u["BB_inf"],
@@ -335,12 +329,8 @@ def avaliar_fundamentos(info, dy12m):
     nota = aprovados / len(avaliados) if avaliados else None
     if nota is None:
         leitura = "Sem dados suficientes"
-    elif nota >= 0.7:
-        leitura = "Fundamentos sólidos"
-    elif nota >= 0.4:
-        leitura = "Fundamentos mistos"
     else:
-        leitura = "Fundamentos fracos"
+        leitura = f"{aprovados} de {len(avaliados)} critérios de referência atendidos"
     return {
         "criterios": criterios,
         "aprovados": aprovados,
@@ -541,7 +531,7 @@ def resumo_ativo(ticker):
         "dia": (float(u["Close"]) / float(ant["Close"]) - 1) * 100,
         "rsi": float(u["RSI"]) if pd.notna(u["RSI"]) else None,
         "tendencia": analisar_tendencia(d)["geral"].replace("Tendência de ", "").replace("Tendência ", ""),
-        "momento": avaliar_momento(d)["veredito"],
+        "momento": avaliar_momento(d)["curto"],
     }
 
 
@@ -1572,6 +1562,213 @@ def render_risco(dados, escolha):
             "no mesmo dia, vale o stop. Passado não garante o futuro.")
 
 
+# ------------------------------------------------------------------ comparador
+# Cada critério: (chave, rótulo, pontua mais com valor "maior" ou "menor", explicação)
+CRITERIOS = [
+    ("pl", "P/L", "menor", "Preço dividido pelo lucro por ação: quantos anos de lucro o preço atual "
+                           "'paga'. Só faz sentido com lucro positivo."),
+    ("pvp", "P/VP", "menor", "Preço dividido pelo patrimônio líquido por ação."),
+    ("ev_ebitda", "EV/EBITDA", "menor", "Valor da empresa (incluindo a dívida) dividido pelo resultado "
+                                        "operacional antes de depreciação e amortização."),
+    ("dy", "Dividend Yield 12m (%)", "maior", "Dividendos pagos nos últimos 12 meses divididos pelo preço."),
+    ("roe", "ROE (%)", "maior", "Lucro dividido pelo patrimônio líquido: retorno sobre o capital dos acionistas."),
+    ("margem", "Margem líquida (%)", "maior", "Quanto sobra de lucro para cada R$ 100 de receita."),
+    ("divida", "Dívida/Patrimônio (%)", "menor", "Quanto a empresa deve em relação ao patrimônio. Bancos e "
+                                                 "outros setores têm padrões próprios."),
+    ("cresc", "Crescimento da receita (%)", "maior", "Variação da receita no período mais recente informado."),
+    ("ret12", "Retorno 12 meses (%)", "maior", "Variação do preço em 12 meses. Passado não garante o futuro."),
+    ("vol", "Volatilidade 12m (% a.a.)", "menor", "Oscilação anualizada dos retornos diários: quanto o preço balança."),
+    ("mdd", "Maior queda 12m (%)", "maior", "Maior queda do pico ao fundo nos últimos 12 meses "
+                                            "(valores menos negativos pontuam mais)."),
+]
+ROTULO_CRIT = {k: r for k, r, _, _ in CRITERIOS}
+PRESETS_CRIT = {
+    "Exemplo: valor": {"pl": 3, "pvp": 3, "ev_ebitda": 3, "divida": 1},
+    "Exemplo: dividendos": {"dy": 5, "margem": 1, "divida": 2, "roe": 1},
+    "Exemplo: qualidade": {"roe": 4, "margem": 3, "divida": 3, "cresc": 2},
+    "Exemplo: momento": {"ret12": 4, "vol": 2, "mdd": 2},
+}
+MAX_COMPARAR = 8
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def metricas_ativo(simbolo):
+    hist = carregar_historico(simbolo)
+    if hist is None or hist.empty or len(hist) < 30:
+        return None
+    info = carregar_info(simbolo)
+    c = hist["Close"].dropna()
+    cripto = eh_cripto(simbolo, info.get("quoteType"))
+    ano = 365 if cripto else 252
+    janela = c.tail(ano + 1)
+
+    def pos(v):
+        return v if v is not None and v > 0 else None
+
+    ret12 = (float(janela.iloc[-1]) / float(janela.iloc[0]) - 1) * 100 if len(janela) > ano * 0.6 else None
+    rets = np.log(c.tail(ano + 1)).diff().dropna()
+    vol = float(rets.std() * np.sqrt(ano) * 100) if len(rets) >= 30 else None
+    mdd = float((janela / janela.cummax() - 1).min() * 100) if len(janela) >= 30 else None
+    roe, margem, cresc = num(info, "returnOnEquity"), num(info, "profitMargins"), num(info, "revenueGrowth")
+    divida = num(info, "debtToEquity")
+    dy = None
+    if not cripto:
+        dy = dividend_yield_12m(carregar_dividendos(simbolo), float(c.iloc[-1]))
+        dy = 0.0 if dy is None else dy
+    return {"pl": pos(num(info, "trailingPE")), "pvp": pos(num(info, "priceToBook")),
+            "ev_ebitda": pos(num(info, "enterpriseToEbitda")), "dy": dy,
+            "roe": roe * 100 if roe is not None else None,
+            "margem": margem * 100 if margem is not None else None,
+            "divida": divida if divida is not None and divida >= 0 else None,
+            "cresc": cresc * 100 if cresc is not None else None,
+            "ret12": ret12, "vol": vol, "mdd": mdd}
+
+
+def pontuar(tabela, pesos):
+    """tabela: linhas = ativos, colunas = chaves dos critérios (NaN = sem dado).
+    Cada critério vira uma nota 0-100 pela posição do ativo entre os escolhidos (ranking, não
+    magnitude, para que valores extremos não distorçam). Sem dado: o critério é ignorado para
+    aquele ativo. Devolve (notas por critério, resultado com pontuação e cobertura)."""
+    direcao = {k: m for k, _, m, _ in CRITERIOS}
+    notas = pd.DataFrame(np.nan, index=tabela.index, columns=tabela.columns)
+    for k in tabela.columns:
+        validos = tabela[k].dropna()
+        if validos.empty:
+            continue
+        if len(validos) == 1:
+            notas.loc[validos.index, k] = 50.0
+            continue
+        pos = validos.rank(method="average", ascending=(direcao[k] == "maior"))
+        notas.loc[validos.index, k] = (pos - 1) / (len(validos) - 1) * 100
+    w = pd.Series({k: float(pesos.get(k, 0)) for k in tabela.columns})
+    disponivel = notas.notna().mul(w).sum(axis=1)
+    pontos = notas.mul(w).sum(axis=1, skipna=True) / disponivel.where(disponivel > 0)
+    cobertura = disponivel / w.sum() * 100 if w.sum() > 0 else disponivel * 0
+    return notas, pd.DataFrame({"Pontuação": pontos, "Cobertura (%)": cobertura})
+
+
+def cmp_adicionar_busca(resultados):
+    ss = st.session_state
+    r = resultados[ss.get("cmp_res", 0)]
+    cmp_incluir({"simbolo": r["simbolo"], "nome": r["nome"], "tipo": r["tipo"]})
+
+
+def cmp_incluir(ativo):
+    ss = st.session_state
+    lista = ss.setdefault("cmp_lista", [])
+    if not any(a["simbolo"] == ativo["simbolo"] for a in lista):
+        lista.append(ativo)
+    sel = list(ss.get("cmp_sel", []))
+    if ativo["simbolo"] not in sel:
+        ss["cmp_sel"] = sel + [ativo["simbolo"]]
+
+
+def cmp_preset(nome):
+    for k, _, _, _ in CRITERIOS:
+        st.session_state[f"cmp_w_{k}"] = PRESETS_CRIT.get(nome, {}).get(k, 0) if nome else 0
+    if nome is None:
+        return
+
+
+def cmp_todos_iguais():
+    for k, _, _, _ in CRITERIOS:
+        st.session_state[f"cmp_w_{k}"] = 1
+
+
+def render_comparador(dados, escolha):
+    ss = st.session_state
+    st.markdown("### ⚖️ Comparador de ativos")
+    st.caption("Escolha os ativos e dê o peso que quiser a cada critério. A pontuação é só o resultado "
+               "dos SEUS pesos: a ferramenta não indica o que comprar.")
+    if "cmp_lista" not in ss:
+        ini = [{"simbolo": f["simbolo"], "nome": f["nome"], "tipo": f["tipo"]}
+               for f in dados["favoritos"][:5]]
+        if escolha and not any(a["simbolo"] == escolha["simbolo"] for a in ini):
+            ini.append({"simbolo": escolha["simbolo"], "nome": escolha["nome"], "tipo": escolha["tipo"]})
+        ss["cmp_lista"] = ini
+        ss["cmp_sel"] = [a["simbolo"] for a in ini]
+
+    # ---- escolher os ativos
+    consulta = st.text_input("Adicionar ativo à comparação (nome ou código)", key="cmp_busca")
+    if consulta.strip():
+        achados = buscar_ativos(consulta)
+        if achados:
+            st.selectbox("Resultado", range(len(achados)), key="cmp_res",
+                         format_func=lambda k: achados[k]["rotulo"])
+            st.button("Adicionar à comparação", on_click=cmp_adicionar_busca, args=(achados,))
+        else:
+            st.caption("Nada encontrado para esse texto.")
+    if escolha and not any(a["simbolo"] == escolha["simbolo"] for a in ss["cmp_lista"]):
+        st.button(f"Adicionar {escolha['simbolo']} (da barra lateral)", on_click=cmp_incluir,
+                  args=({"simbolo": escolha["simbolo"], "nome": escolha["nome"], "tipo": escolha["tipo"]},))
+    nomes = {a["simbolo"]: a["nome"] for a in ss["cmp_lista"]}
+    sel = st.multiselect("Ativos na comparação", list(nomes), key="cmp_sel",
+                         format_func=lambda s: f"{nomes[s]} ({s})")
+    if len(sel) > MAX_COMPARAR:
+        st.warning(f"Comparando só os {MAX_COMPARAR} primeiros.")
+        sel = sel[:MAX_COMPARAR]
+    if len(sel) < 2:
+        st.info("Escolha pelo menos 2 ativos para comparar.")
+        return
+
+    # ---- pesos
+    with st.expander("⚙️ Pesos dos critérios (0 = ignorar, 5 = muito importante)", expanded=False):
+        cols = st.columns(3)
+        cols[0].button("Todos iguais", on_click=cmp_todos_iguais, key="cmp_p_iguais")
+        cols[1].button("Zerar", on_click=cmp_preset, args=(None,), key="cmp_p_zero")
+        for i, nome in enumerate(PRESETS_CRIT):
+            cols[2].button(nome, on_click=cmp_preset, args=(nome,), key=f"cmp_p_{i}")
+        for k, rot, _, _ in CRITERIOS:
+            ss.setdefault(f"cmp_w_{k}", 1)
+            st.slider(rot, 0, 5, key=f"cmp_w_{k}")
+        st.caption("Os exemplos mostram ênfases comuns em estudos de investimento. São pontos de "
+                   "partida didáticos, não recomendação.")
+    pesos = {k: ss.get(f"cmp_w_{k}", 1) for k, _, _, _ in CRITERIOS}
+
+    # ---- dados
+    with st.spinner("Buscando os indicadores..."):
+        linhas = {s: metricas_ativo(s) for s in sel}
+    ok = {s: m for s, m in linhas.items() if m}
+    for s in sel:
+        if s not in ok:
+            st.caption(f"Sem dados suficientes para {s}; ele ficou de fora.")
+    if len(ok) < 2:
+        st.info("Preciso de dados de pelo menos 2 ativos para comparar.")
+        return
+    chaves = [k for k, _, _, _ in CRITERIOS]
+    tabela = pd.DataFrame({s: {k: (m.get(k) if m.get(k) is not None else np.nan) for k in chaves}
+                           for s, m in ok.items()}).T[chaves].astype(float)
+    st.markdown("#### Indicadores")
+    st.dataframe(tabela.rename(columns=ROTULO_CRIT), use_container_width=True,
+                 column_config={ROTULO_CRIT[k]: st.column_config.NumberColumn(format="%.2f") for k in chaves})
+
+    if sum(pesos.values()) == 0:
+        st.info("Dê peso maior que zero a pelo menos um critério para ver a pontuação.")
+    else:
+        notas, res = pontuar(tabela, pesos)
+        res = res.sort_values("Pontuação", ascending=False)
+        st.markdown("#### Pontuação pelos seus critérios")
+        st.bar_chart(res["Pontuação"])
+        st.dataframe(res, use_container_width=True,
+                     column_config={"Pontuação": st.column_config.NumberColumn(format="%.0f"),
+                                    "Cobertura (%)": st.column_config.NumberColumn(format="%.0f%%")})
+        with st.expander("Notas por critério (0 a 100)"):
+            usados = [k for k in chaves if pesos[k] > 0]
+            st.dataframe(notas[usados].rename(columns=ROTULO_CRIT), use_container_width=True,
+                         column_config={ROTULO_CRIT[k]: st.column_config.NumberColumn(format="%.0f")
+                                        for k in usados})
+        st.caption("Como funciona: para cada critério, o ativo recebe de 0 a 100 conforme sua posição "
+                   "entre os escolhidos (com 2 ativos, uma diferença pequena vira 0 contra 100). "
+                   "Dado ausente é ignorado e reduz a cobertura. A pontuação não considera preço "
+                   "justo, seus objetivos, seu perfil de risco nem fatos específicos de cada empresa. "
+                   "Cripto não tem balanço, então os critérios de empresa ficam sem dado.")
+
+    with st.expander("📚 O que significa cada critério"):
+        for k, rot, melhor, expl in CRITERIOS:
+            st.markdown(f"**{rot}** (pontua mais com valor {melhor}): {expl}")
+    st.caption("Conteúdo educacional. Não é recomendação de investimento.")
+
+
 # --------------------------------------------------------------------- app
 def render_analise(escolha, periodo):
     ticker = escolha["simbolo"]
@@ -1622,22 +1819,22 @@ def render_analise(escolha, periodo):
 
     aba_res, aba_sobre, aba_graf, aba_fund, aba_tend, aba_mom = st.tabs(
         ["Resumo", "Sobre o ativo", "Gráficos", "Fundamentos", "Tendência e médias",
-         "Momento de compra"])
+         "Leitura técnica"])
 
     with aba_res:
         a, b, c = st.columns(3)
         if fund:
-            a.metric("Fundamentos", fund["leitura"],
-                     f"{fund['aprovados']}/{fund['total']} critérios", delta_color="off")
+            a.metric("Critérios de referência", f"{fund['aprovados']} de {fund['total']}",
+                     "atendidos", delta_color="off")
         else:
-            a.metric("Fundamentos", "Não se aplica", "criptomoeda", delta_color="off")
+            a.metric("Critérios de referência", "Não se aplica", "criptomoeda", delta_color="off")
         b.metric("Tendência", tendencia["geral"].replace("Tendência de ", "").replace("Tendência ", ""))
-        c.metric("Momento técnico", momento["veredito"],
-                 f"{momento['total']:+d} de ±{momento['maximo']}", delta_color="off")
+        c.metric("Sinais técnicos", momento["curto"], "alta · baixa · neutro", delta_color="off")
         st.write(
             "O resumo cruza três leituras independentes: **valor** (fundamentos), "
             "**direção** (tendência) e **timing** (sinais técnicos). "
-            "Um ativo pode ter bons fundamentos e mau momento técnico, e vice-versa. "
+            "Os indicadores de valor e os sinais técnicos podem apontar em direções diferentes; "
+            "cabe a você pesar cada leitura. "
             "Veja o detalhe nas outras abas.")
         if cripto:
             st.warning("Criptomoedas são muito mais voláteis que ações e não têm balanço "
@@ -1664,7 +1861,7 @@ def render_analise(escolha, periodo):
             x2.metric("Oferta circulante", grande(num(info, "circulatingSupply")))
             x3.metric("Volume 24h", grande(num(info, "volume24Hr") or float(u["Volume"])))
         else:
-            st.markdown(f"### {fund['leitura']}  ·  {fund['aprovados']} de {fund['total']} critérios atendidos")
+            st.markdown(f"### {fund['leitura']}")
             tabela = pd.DataFrame(
                 [{"Indicador": n, "Valor": v, "Referência": r,
                   "Resultado": "✅" if ok else ("❌" if ok is False else "➖ sem dado")}
@@ -1706,26 +1903,24 @@ def render_analise(escolha, periodo):
         v3.metric("Média 1 ano", grande(float(janela_52["Volume"].mean())))
 
     with aba_mom:
-        st.markdown(f"### Momento técnico: {momento['veredito']} "
-                    f"({momento['total']:+d} de ±{momento['maximo']})")
+        st.markdown(f"### Leitura técnica: {momento['leitura']}")
         st.dataframe(
-            pd.DataFrame([{"Sinal": n, "Pontos": f"{p:+d}", "Leitura": t}
-                          for n, p, t in momento["sinais"]]),
+            pd.DataFrame([{"Sinal": n, "Direção": "↑ alta" if p > 0 else ("↓ baixa" if p < 0 else "→ neutro"),
+                           "Leitura": t} for n, p, t in momento["sinais"]]),
             hide_index=True, use_container_width=True)
-        st.markdown("#### Níveis para observar")
+        st.markdown("#### Níveis de referência")
         n1, n2, n3, n4 = st.columns(4)
         n1.metric("Suporte (60 dias)", f"{simbolo} {br(momento['suporte'])}")
         n2.metric("Resistência (60 dias)", f"{simbolo} {br(momento['resistencia'])}")
         n3.metric("Banda inferior Bollinger", f"{simbolo} {br(momento['bb_inf'])}")
         n4.metric("Média 50 dias", f"{simbolo} {br(momento['sma50'])}")
         st.write(
-            "Regiões próximas ao suporte, à banda inferior ou à média de 50 dias costumam ser "
-            "pontos de observação para entradas, ao passo que rompimentos abaixo do suporte "
-            "indicam que a leitura pode estar errada.")
+            "Suporte, resistência, bandas e médias são regiões onde o preço já reagiu no passado e "
+            "que analistas usam como referência. Se o preço romper esses níveis, a leitura pode mudar.")
         st.warning(
-            "O placar mede apenas o momento técnico, com regras simples e conhecidas. "
-            "Ele não prevê preços e ignora notícias, resultados e o seu perfil de risco. "
-            "Não é recomendação de investimento.")
+            "Os sinais descrevem o comportamento recente do preço com regras simples e conhecidas. "
+            "Eles não preveem preços e ignoram notícias, resultados e o seu perfil de risco. "
+            "Conteúdo educacional; não é recomendação de investimento.")
 
 
 def render_favoritos(dados):
@@ -1744,7 +1939,7 @@ def render_favoritos(dados):
             "Dia": pct(r["dia"]) if r else "—",
             "RSI": br(r["rsi"], 0) if r and r["rsi"] is not None else "—",
             "Tendência": r["tendencia"] if r else "—",
-            "Momento técnico": r["momento"] if r else "—"})
+            "Sinais técnicos": r["momento"] if r else "—"})
     st.dataframe(pd.DataFrame(linhas), hide_index=True, use_container_width=True)
     st.caption("Para abrir a análise completa, escolha 'Favoritos' na barra lateral.")
 
@@ -1881,9 +2076,9 @@ def main():
                    + (br(a['valor'], 0) if a['tipo'] == 'rsi_abaixo' else f"{m} {br(a['valor'])}"))
 
     st.session_state["_escolha"] = escolha
-    t_an, t_fav, t_ca, t_rk, t_b3, t_mc, t_al, t_nt, t_cr = st.tabs(
-        ["Análise", "⭐ Favoritos", "💼 Carteira", "🛡️ Risco", "📊 B3 hoje", "🪙 Mercado cripto",
-         "🔔 Alertas", "📰 Notícias", "📰 Notícias cripto"])
+    t_an, t_fav, t_cmp, t_ca, t_rk, t_b3, t_mc, t_al, t_nt, t_cr = st.tabs(
+        ["Análise", "⭐ Favoritos", "⚖️ Comparador", "💼 Carteira", "🛡️ Risco", "📊 B3 hoje",
+         "🪙 Mercado cripto", "🔔 Alertas", "📰 Notícias", "📰 Notícias cripto"])
     with t_an:
         if escolha:
             render_analise(escolha, periodo)
@@ -1891,6 +2086,8 @@ def main():
             st.info("Digite o nome ou código de um ativo na barra lateral.")
     with t_fav:
         render_favoritos(dados)
+    with t_cmp:
+        render_comparador(dados, escolha)
     with t_ca:
         render_carteira(dados, escolha)
     with t_rk:
@@ -1905,6 +2102,10 @@ def main():
         render_noticias(dados, escolha)
     with t_cr:
         render_cripto()
+    st.divider()
+    st.caption("Conteúdo educacional e informativo. Não constitui recomendação de investimento, "
+               "oferta ou consultoria. Cada investidor é responsável por suas decisões. "
+               "Dados de fontes públicas, que podem conter atrasos ou erros.")
 
 
 if __name__ == "__main__":
