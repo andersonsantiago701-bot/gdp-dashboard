@@ -2030,4 +2030,469 @@ TRILHAS = [
                "Uma ação de empresa de tecnologia", "Um título público"],
          "c": 0, "e": "Ela busca estabilidade, mas depende do lastro e do emissor."},
     ]},
-    {
+    {"id": "risco", "titulo": "Gestão de risco e comportamento", "nivel": "Todos os níveis", "aulas": [
+        {"id": "rk1", "titulo": "Quanto arriscar em cada operação",
+         "texto": "Uma regra comum de gestão de risco é definir, antes de entrar, quanto do capital você aceita perder se o plano "
+                  "der errado. A quantidade sai da conta: **valor em risco ÷ distância até o stop**. Exemplo: capital de "
+                  "R$ 10.000, risco de 1% (R$ 100) e stop R$ 2 abaixo da entrada resultam em 50 unidades. O percentual de risco "
+                  "é uma escolha pessoal.",
+         "ferramenta": "Aba Risco → Calculadora de posição"},
+        {"id": "rk2", "titulo": "Taxa de acerto, payoff e expectativa",
+         "texto": "Acertar pouco pode ser compatível com resultado positivo, e acertar muito pode não ser. Tudo depende do "
+                  "**payoff** (ganho médio ÷ perda média). Exemplo: ganhar em 40% das vezes, com ganhos de 2R e perdas de 1R, "
+                  "dá uma expectativa de 0,4 × 2 − 0,6 × 1 = +0,2R por operação. Para saber os seus números, é preciso "
+                  "registrar tudo, inclusive os prejuízos.",
+         "ferramenta": "Aba Risco → Diário de operações e Backtest"},
+        {"id": "rk3", "titulo": "Vieses comportamentais",
+         "texto": "Decisões financeiras sofrem com vieses: **excesso de confiança**, **aversão à perda** (segurar o que cai para "
+                  "não realizar o prejuízo), **efeito manada**, medo de ficar de fora (FOMO) e **viés de confirmação**. "
+                  "Práticas que ajudam: plano escrito antes de agir, registro das decisões e revisão periódica.",
+         "ferramenta": "Aba Risco → Diário de operações"},
+        {"id": "rk4", "titulo": "Golpes e promessas de ganho fácil",
+         "texto": "Desconfie de rentabilidade garantida acima do normal, pressa para decidir, pagamento por indicação, "
+                  "'robôs' que prometem lucro certo e contas de desconhecidos que 'devolvem' mais dinheiro. Antes de entregar "
+                  "dinheiro a uma empresa, consulte se ela é autorizada nos sites da CVM e do Banco Central.",
+         "ferramenta": "—"},
+    ], "quiz": [
+        {"p": "Capital de R$ 20.000, risco de 1% e stop R$ 4 abaixo da entrada. Quantas unidades a conta indica?",
+         "o": ["50", "5", "500"], "c": 0, "e": "R$ 200 de risco ÷ R$ 4 por unidade = 50 unidades."},
+        {"p": "Ganhar em 40% das operações, com ganhos de 2R e perdas de 1R, resulta em expectativa:",
+         "o": ["Negativa", "Positiva, de +0,2R por operação", "Nula"],
+         "c": 1, "e": "0,4 × 2 − 0,6 × 1 = +0,2R. Sem custos, claro."},
+        {"p": "Qual destes é um sinal de alerta de golpe?",
+         "o": ["Divulgação clara dos riscos", "Promessa de rentabilidade garantida acima do normal e pressa para decidir",
+               "Empresa autorizada na CVM"],
+         "c": 1, "e": "Promessa de ganho garantido e pressão para decidir são sinais clássicos."},
+    ]},
+]
+ID_AULAS = {a["id"] for t in TRILHAS for a in t["aulas"]}
+
+
+def filtrar_glossario(busca):
+    busca = (busca or "").strip().lower()
+    itens = sorted(GLOSSARIO.items(), key=lambda kv: kv[0].lower())
+    if not busca:
+        return itens
+    return [(t, d) for t, d in itens if busca in t.lower() or busca in d.lower()]
+
+
+def _progresso(d):
+    p = d.setdefault("progresso", {})
+    p.setdefault("aulas", [])
+    p.setdefault("quiz", {})
+    return p
+
+
+def salvar_aula(aula_id):
+    marcado = bool(st.session_state.get(f"aula_{aula_id}"))
+
+    def fn(d):
+        aulas = _progresso(d)["aulas"]
+        if marcado and aula_id not in aulas:
+            aulas.append(aula_id)
+        if not marcado and aula_id in aulas:
+            aulas.remove(aula_id)
+    mutar(fn)
+
+
+def corrigir_quiz(trilha_id):
+    ss = st.session_state
+    trilha = next(t for t in TRILHAS if t["id"] == trilha_id)
+    certos = [ss.get(f"quiz_{trilha_id}_{i}") == q["o"][q["c"]] for i, q in enumerate(trilha["quiz"])]
+    ss[f"quiz_ok_{trilha_id}"] = certos
+
+    def fn(d):
+        _progresso(d)["quiz"][trilha_id] = {"acertos": sum(certos), "total": len(certos)}
+    mutar(fn)
+
+
+def render_aprender(dados):
+    prog = dados.get("progresso", {})
+    feitas = set(prog.get("aulas", [])) & ID_AULAS
+    st.markdown("### 📚 Aprender")
+    st.caption("Conteúdo educacional sobre como analisar investimentos. Não considera a sua situação "
+               "pessoal e não é recomendação. Para orientação personalizada, procure um profissional habilitado.")
+    st.progress(len(feitas) / len(ID_AULAS), text=f"{len(feitas)} de {len(ID_AULAS)} aulas concluídas")
+
+    aba_tr, aba_gl = st.tabs(["Trilhas de estudo", "Glossário"])
+    with aba_tr:
+        for t in TRILHAS:
+            ids = [a["id"] for a in t["aulas"]]
+            n = len([i for i in ids if i in feitas])
+            with st.expander(f"{t['titulo']} · {t['nivel']} · {n}/{len(ids)} aulas"):
+                for a in t["aulas"]:
+                    st.markdown(f"#### {a['titulo']}")
+                    st.markdown(a["texto"].replace("$", "\\$"))
+                    if a["ferramenta"] != "—":
+                        st.caption(f"🔧 Veja no app: {a['ferramenta']}")
+                    st.checkbox("Marcar como concluída", value=a["id"] in feitas, key=f"aula_{a['id']}",
+                                on_change=salvar_aula, args=(a["id"],))
+                st.markdown("#### ✍️ Quiz da trilha")
+                for i, q in enumerate(t["quiz"]):
+                    st.radio(f"{i + 1}. {q['p']}", q["o"], index=None, key=f"quiz_{t['id']}_{i}")
+                st.button("Corrigir", key=f"corrigir_{t['id']}", on_click=corrigir_quiz, args=(t["id"],))
+                certos = st.session_state.get(f"quiz_ok_{t['id']}")
+                if certos is not None:
+                    for i, (q, ok) in enumerate(zip(t["quiz"], certos)):
+                        st.markdown(f"{'✅' if ok else '❌'} **{i + 1}.** {q['e']}")
+                    st.caption(f"Resultado: {sum(certos)} de {len(certos)}.")
+                elif t["id"] in prog.get("quiz", {}):
+                    r = prog["quiz"][t["id"]]
+                    st.caption(f"Último resultado salvo: {r['acertos']} de {r['total']}.")
+        st.caption("Para ir além: Portal do Investidor (CVM), B3 Educação e o site do Tesouro Direto "
+                   "têm material gratuito.")
+    with aba_gl:
+        busca = st.text_input("Buscar termo", key="gloss_busca")
+        itens = filtrar_glossario(busca)
+        if not itens:
+            st.info("Nenhum termo encontrado.")
+        for termo, definicao in itens:
+            st.markdown(f"**{termo}**: {definicao}")
+
+
+# --------------------------------------------------------------------- app
+def render_analise(escolha, periodo):
+    ticker = escolha["simbolo"]
+    with st.spinner(f"Buscando dados de {ticker}..."):
+        hist = carregar_historico(ticker)
+        info = carregar_info(ticker)
+        divs = carregar_dividendos(ticker)
+
+    if hist is None or hist.empty or len(hist) < 30:
+        st.error(f"Não encontrei histórico suficiente para {ticker}.")
+        return
+
+    cripto = escolha["tipo"] == "CRYPTOCURRENCY" or info.get("quoteType") == "CRYPTOCURRENCY"
+    dias_ano = 365 if cripto else 252  # cripto negocia todos os dias
+
+    d = calcular_indicadores(hist)
+    u = d.iloc[-1]
+    ant = d.iloc[-2]
+    preco = float(u["Close"])
+    variacao = (preco / float(ant["Close"]) - 1) * 100
+    moeda = info.get("currency", "USD" if cripto else "BRL")
+    simbolo = {"BRL": "R$", "USD": "US$"}.get(moeda, moeda)
+
+    nome = info.get("longName") or info.get("shortName") or escolha["nome"]
+    st.subheader(f"{nome} ({ticker})")
+    if info.get("sector"):
+        st.caption(f"{info.get('sector')} · {info.get('industry', '')}")
+
+    janela_52 = d.tail(dias_ano)
+    max52, min52 = float(janela_52["High"].max()), float(janela_52["Low"].min())
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Preço", f"{simbolo} {br(preco)}", f"{br(variacao)}%")
+    c2.metric("Máx. 12 meses", f"{simbolo} {br(max52)}",
+              f"{br((preco / max52 - 1) * 100, 1)}% do topo", delta_color="off")
+    c3.metric("Mín. 12 meses", f"{simbolo} {br(min52)}",
+              f"{br((preco / min52 - 1) * 100, 1)}% do fundo", delta_color="off")
+    c4.metric("Valor de mercado", grande(num(info, "marketCap")))
+
+    n_dias = {"6 meses": dias_ano // 2, "1 ano": dias_ano,
+              "2 anos": dias_ano * 2, "5 anos": len(d)}[periodo]
+    visivel = d.tail(n_dias)
+
+    tendencia = analisar_tendencia(d)
+    momento = avaliar_momento(d)
+    fund = None if cripto else avaliar_fundamentos(
+        info, dividend_yield_12m(divs, preco))
+
+    aba_res, aba_sobre, aba_graf, aba_fund, aba_tend, aba_mom = st.tabs(
+        ["Resumo", "Sobre o ativo", "Gráficos", "Fundamentos", "Tendência e médias",
+         "Leitura técnica"])
+
+    with aba_res:
+        a, b, c = st.columns(3)
+        if fund:
+            a.metric("Critérios de referência", f"{fund['aprovados']} de {fund['total']}",
+                     "atendidos", delta_color="off")
+        else:
+            a.metric("Critérios de referência", "Não se aplica", "criptomoeda", delta_color="off")
+        b.metric("Tendência", tendencia["geral"].replace("Tendência de ", "").replace("Tendência ", ""))
+        c.metric("Sinais técnicos", momento["curto"], "alta · baixa · neutro", delta_color="off")
+        st.write(
+            "O resumo cruza três leituras independentes: **valor** (fundamentos), "
+            "**direção** (tendência) e **timing** (sinais técnicos). "
+            "Os indicadores de valor e os sinais técnicos podem apontar em direções diferentes; "
+            "cabe a você pesar cada leitura. "
+            "Veja o detalhe nas outras abas.")
+        if cripto:
+            st.warning("Criptomoedas são muito mais voláteis que ações e não têm balanço "
+                       "nem lucro. A análise aqui é só técnica (preço e volume).")
+        alvo = num(info, "targetMeanPrice")
+        if alvo:
+            st.info(
+                f"Preço-alvo médio dos analistas (Yahoo): {simbolo} {br(alvo)} "
+                f"({br((alvo / preco - 1) * 100, 1)}% vs. preço atual). "
+                "Projeções de analistas costumam errar e variam bastante.")
+
+    with aba_sobre:
+        render_sobre(escolha, info, cripto, simbolo)
+
+    with aba_graf:
+        st.plotly_chart(grafico_principal(visivel), use_container_width=True)
+
+    with aba_fund:
+        if cripto:
+            st.markdown("### Criptomoeda: sem fundamentos tradicionais")
+            st.write("Não há P/L, ROE ou dividendos. Alguns dados de mercado:")
+            x1, x2, x3 = st.columns(3)
+            x1.metric("Valor de mercado", grande(num(info, "marketCap")))
+            x2.metric("Oferta circulante", grande(num(info, "circulatingSupply")))
+            x3.metric("Volume 24h", grande(num(info, "volume24Hr") or float(u["Volume"])))
+        else:
+            st.markdown(f"### {fund['leitura']}")
+            tabela = pd.DataFrame(
+                [{"Indicador": n, "Valor": v, "Referência": r,
+                  "Resultado": "✅" if ok else ("❌" if ok is False else "➖ sem dado")}
+                 for n, v, r, ok in fund["criterios"]])
+            st.dataframe(tabela, hide_index=True, use_container_width=True)
+            st.caption("Limites genéricos de referência. Bancos, seguradoras, FIIs e empresas de "
+                       "crescimento têm padrões próprios; compare sempre com o setor.")
+            x1, x2, x3, x4 = st.columns(4)
+            x1.metric("Lucro por ação (LPA)", br(num(info, "trailingEps")))
+            x2.metric("Valor patrimonial/ação", br(num(info, "bookValue")))
+            x3.metric("Receita (12m)", grande(num(info, "totalRevenue")))
+            x4.metric("Beta", br(num(info, "beta")))
+            if divs is not None and not divs.empty:
+                st.plotly_chart(grafico_dividendos(divs), use_container_width=True)
+
+    with aba_tend:
+        st.markdown(f"### {tendencia['geral']}")
+        for prazo, rot, txt in tendencia["itens"]:
+            st.write(f"**{prazo}:** {rot}. {txt}")
+        st.write(f"**Cruzamento de médias:** {tendencia['cruzamento']}")
+        if tendencia["inclinacao"] is not None:
+            st.write(f"**Inclinação da média de 50 dias (último mês):** "
+                     f"{pct(tendencia['inclinacao'])}")
+        linhas = []
+        for n in (20, 50, 200):
+            m = u[f"SMA{n}"]
+            linhas.append({
+                "Média": f"Simples {n} dias",
+                "Valor": br(m) if pd.notna(m) else "—",
+                "Preço vs. média": pct((preco / m - 1) * 100) if pd.notna(m) else "—"})
+        m_ano = float(janela_52["Close"].mean())
+        linhas.append({"Média": "Último ano", "Valor": br(m_ano),
+                       "Preço vs. média": pct((preco / m_ano - 1) * 100)})
+        st.dataframe(pd.DataFrame(linhas), hide_index=True, use_container_width=True)
+        st.markdown("#### Volume de negociação")
+        v1, v2, v3 = st.columns(3)
+        v1.metric("Último dia", grande(float(u["Volume"])))
+        v2.metric("Média 20 dias", grande(float(u["VOL_MM20"])))
+        v3.metric("Média 1 ano", grande(float(janela_52["Volume"].mean())))
+
+    with aba_mom:
+        st.markdown(f"### Leitura técnica: {momento['leitura']}")
+        st.dataframe(
+            pd.DataFrame([{"Sinal": n, "Direção": "↑ alta" if p > 0 else ("↓ baixa" if p < 0 else "→ neutro"),
+                           "Leitura": t} for n, p, t in momento["sinais"]]),
+            hide_index=True, use_container_width=True)
+        st.markdown("#### Níveis de referência")
+        n1, n2, n3, n4 = st.columns(4)
+        n1.metric("Suporte (60 dias)", f"{simbolo} {br(momento['suporte'])}")
+        n2.metric("Resistência (60 dias)", f"{simbolo} {br(momento['resistencia'])}")
+        n3.metric("Banda inferior Bollinger", f"{simbolo} {br(momento['bb_inf'])}")
+        n4.metric("Média 50 dias", f"{simbolo} {br(momento['sma50'])}")
+        st.write(
+            "Suporte, resistência, bandas e médias são regiões onde o preço já reagiu no passado e "
+            "que analistas usam como referência. Se o preço romper esses níveis, a leitura pode mudar.")
+        st.warning(
+            "Os sinais descrevem o comportamento recente do preço com regras simples e conhecidas. "
+            "Eles não preveem preços e ignoram notícias, resultados e o seu perfil de risco. "
+            "Conteúdo educacional; não é recomendação de investimento.")
+
+
+def render_favoritos(dados):
+    favs = dados["favoritos"]
+    if not favs:
+        st.info("Você ainda não tem favoritos. Escolha um ativo e toque em "
+                "☆ Favoritar na barra lateral.")
+        return
+    linhas = []
+    for f in favs:
+        r = resumo_ativo(f["simbolo"])
+        m = moeda_de(f["simbolo"])
+        linhas.append({
+            "Ativo": f["nome"], "Código": f["simbolo"],
+            "Preço": f"{m} {br(r['preco'])}" if r else "—",
+            "Dia": pct(r["dia"]) if r else "—",
+            "RSI": br(r["rsi"], 0) if r and r["rsi"] is not None else "—",
+            "Tendência": r["tendencia"] if r else "—",
+            "Sinais técnicos": r["momento"] if r else "—"})
+    st.dataframe(pd.DataFrame(linhas), hide_index=True, use_container_width=True)
+    st.caption("Para abrir a análise completa, escolha 'Favoritos' na barra lateral.")
+
+
+def render_alertas(dados, escolha, persistente):
+    st.markdown("### Criar alerta")
+    if not persistente:
+        st.warning("O salvamento ainda não está configurado: seus alertas somem ao recarregar "
+                   "a página e nenhuma notificação é enviada. Veja o LEIA-ME-ALERTAS.md.")
+    else:
+        st.caption("As notificações no celular são enviadas pelo verificador automático "
+                   "(passo 5 do LEIA-ME-ALERTAS.md), a cada ~15 minutos.")
+
+    if escolha is None:
+        st.info("Escolha um ativo na barra lateral para criar um alerta para ele.")
+    else:
+        r = resumo_ativo(escolha["simbolo"])
+        m = moeda_de(escolha["simbolo"])
+        if r is None:
+            st.info("Não consegui o preço atual deste ativo agora.")
+        else:
+            st.write(f"**{escolha['nome']}** ({escolha['simbolo']}) · preço atual "
+                     f"{m} {br(r['preco'])}"
+                     + (f" · RSI {br(r['rsi'], 0)}" if r["rsi"] is not None else ""))
+            tipo = st.selectbox("Avisar quando", list(TIPOS_ALERTA),
+                                format_func=lambda t: TIPOS_ALERTA[t],
+                                key="tipo_alerta")
+            if tipo == "rsi_abaixo":
+                valor = st.number_input("RSI igual ou abaixo de", min_value=1.0,
+                                        max_value=99.0, value=30.0, step=1.0, key="v_rsi")
+            else:
+                padrao = round(r["preco"] * (0.95 if tipo == "preco_abaixo" else 1.05), 2)
+                valor = st.number_input(f"Preço ({m})", min_value=0.0, value=padrao,
+                                        step=0.01, format="%.2f", key=f"v_{tipo}_{escolha['simbolo']}")
+            st.button("Criar alerta", on_click=criar_alerta, args=(escolha, tipo, valor),
+                      type="primary")
+            if tipo == "rsi_abaixo":
+                st.caption("RSI abaixo de 30 costuma indicar queda exagerada (sobrevendido). "
+                           "É um sinal de observação, não garantia de reversão.")
+
+    st.markdown("### Meus alertas")
+    if not dados["alertas"]:
+        st.caption("Nenhum alerta criado.")
+        return
+    for a in dados["alertas"]:
+        m = moeda_de(a["simbolo"])
+        alvo = br(a["valor"], 0) if a["tipo"] == "rsi_abaixo" else f"{m} {br(a['valor'])}"
+        if a.get("disparado_em"):
+            estado = "🔔 disparado em " + a["disparado_em"][:16].replace("T", " ") + " UTC"
+        else:
+            estado = "⏳ ativo"
+        col1, col2, col3 = st.columns([6, 2, 2])
+        col1.write(f"**{a['nome']}** ({a['simbolo']}): {TIPOS_ALERTA[a['tipo']]} {alvo} · {estado}")
+        if a.get("disparado_em"):
+            col2.button("Reativar", key=f"re_{a['id']}", on_click=reativar_alerta, args=(a["id"],))
+        col3.button("Excluir", key=f"ex_{a['id']}", on_click=remover_alerta, args=(a["id"],))
+
+
+def render_noticias(dados, escolha):
+    topo1, topo2 = st.columns([3, 1])
+    topo1.caption("Manchetes de InfoMoney e Google Notícias. Atualiza sozinho a cada 5 minutos.")
+    if topo2.button("🔄 Atualizar"):
+        ler_noticias.clear()
+    opcoes = ["Mercado em geral"]
+    if escolha:
+        opcoes.append("Ativo selecionado")
+    if dados["favoritos"]:
+        opcoes.append("Meus favoritos")
+    foco = st.radio("Mostrar", opcoes, horizontal=True)
+
+    if foco == "Mercado em geral":
+        listas = [ler_noticias("https://www.infomoney.com.br/feed/", "InfoMoney"),
+                  ler_noticias(url_google_noticias("mercado financeiro bolsa B3 dólar"),
+                               "Google Notícias")]
+        mostrar_noticias(juntar_noticias(listas, 25))
+    elif foco == "Ativo selecionado":
+        st.write(f"Notícias sobre **{escolha['nome']}**")
+        lista = ler_noticias(url_google_noticias(consulta_do_ativo(escolha)), "Google Notícias")
+        mostrar_noticias(juntar_noticias([lista], 15))
+    else:
+        for f in dados["favoritos"][:6]:
+            st.markdown(f"#### {f['nome']}")
+            lista = ler_noticias(url_google_noticias(consulta_do_ativo(f)), "Google Notícias")
+            mostrar_noticias(juntar_noticias([lista], 3))
+        if len(dados["favoritos"]) > 6:
+            st.caption("Mostrando os 6 primeiros favoritos.")
+
+
+def main():
+    dados, persistente = ler_dados()
+    barra_cotacoes(dados)
+    st.title("📈 Santinvest")
+    st.caption("Ações, FIIs, ETFs e criptomoedas. Dados do Yahoo Finance. "
+               "Ferramenta de apoio à pesquisa, não é recomendação de compra ou venda.")
+
+    erro = st.session_state.pop("erro_salvar", None)
+    if erro:
+        st.error(erro)
+
+    escolha = None
+    with st.sidebar:
+        st.header("Ativo")
+        modo = "Buscar"
+        if dados["favoritos"]:
+            modo = st.radio("Escolher por", ["Buscar", "Favoritos"], horizontal=True)
+        if modo == "Buscar":
+            texto = st.text_input("Nome ou código", value="Petrobras",
+                                  help="Ex.: Petrobras, Vale, Apple, HGLG11, Bitcoin, Ethereum")
+            resultados = buscar_ativos(texto)
+            if resultados:
+                i = st.selectbox("Escolha o ativo", range(len(resultados)),
+                                 format_func=lambda k: resultados[k]["rotulo"])
+                escolha = resultados[i]
+            else:
+                st.error("Não encontrei esse ativo. Tente outro nome ou o código "
+                         "(ex.: PETR4, BTC-USD).")
+        else:
+            favs = dados["favoritos"]
+            i = st.selectbox("Seus favoritos", range(len(favs)),
+                             format_func=lambda k: f"{favs[k]['nome']} ({favs[k]['simbolo']})")
+            escolha = favs[i]
+        periodo = st.selectbox("Período dos gráficos", ["6 meses", "1 ano", "2 anos", "5 anos"], index=1)
+        if escolha:
+            ja = any(f["simbolo"] == escolha["simbolo"] for f in dados["favoritos"])
+            st.button("★ Remover dos favoritos" if ja else "☆ Favoritar",
+                      on_click=alternar_favorito, args=(escolha,), use_container_width=True)
+        st.caption("💾 Favoritos e alertas salvos." if persistente else
+                   "⚠️ Salvamento não configurado: favoritos e alertas somem ao recarregar.")
+
+    for a, r in alertas_atingidos(dados):
+        m = moeda_de(a["simbolo"])
+        st.warning(f"🔔 Alerta atingido: {a['nome']} ({a['simbolo']}) está em "
+                   f"{m} {br(r['preco'])} · {TIPOS_ALERTA[a['tipo']]} "
+                   + (br(a['valor'], 0) if a['tipo'] == 'rsi_abaixo' else f"{m} {br(a['valor'])}"))
+
+    st.session_state["_escolha"] = escolha
+    t_an, t_fav, t_cmp, t_ap, t_ca, t_rk, t_b3, t_us, t_mc, t_al, t_nt, t_cr = st.tabs(
+        ["Análise", "⭐ Favoritos", "⚖️ Comparador", "📚 Aprender", "💼 Carteira", "🛡️ Risco",
+         "📊 B3 hoje", "🇺🇸 EUA hoje", "🪙 Mercado cripto", "🔔 Alertas", "📰 Notícias",
+         "📰 Notícias cripto"])
+    with t_an:
+        if escolha:
+            render_analise(escolha, periodo)
+        else:
+            st.info("Digite o nome ou código de um ativo na barra lateral.")
+    with t_fav:
+        render_favoritos(dados)
+    with t_cmp:
+        render_comparador(dados, escolha)
+    with t_ap:
+        render_aprender(dados)
+    with t_ca:
+        render_carteira(dados, escolha)
+    with t_rk:
+        render_risco(dados, escolha)
+    with t_b3:
+        render_b3_hoje(dados)
+    with t_us:
+        render_eua_hoje(dados)
+    with t_mc:
+        render_mercado_cripto()
+    with t_al:
+        render_alertas(dados, escolha, persistente)
+    with t_nt:
+        render_noticias(dados, escolha)
+    with t_cr:
+        render_cripto()
+    st.divider()
+    st.caption("Conteúdo educacional e informativo. Não constitui recomendação de investimento, "
+               "oferta ou consultoria. Cada investidor é responsável por suas decisões. "
+               "Dados de fontes públicas, que podem conter atrasos ou erros.")
+
+
+if __name__ == "__main__":
+    main()
