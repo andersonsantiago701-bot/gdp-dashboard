@@ -408,7 +408,8 @@ TIPOS_ALERTA = {
 
 
 def _vazio():
-    return {"favoritos": [], "alertas": [], "carteira": [], "diario": []}
+    return {"favoritos": [], "alertas": [], "carteira": [], "diario": [],
+            "progresso": {"aulas": [], "quiz": {}}}
 
 
 def _config_gist():
@@ -432,6 +433,7 @@ def _ler_gist():
     dados.setdefault("alertas", [])
     dados.setdefault("carteira", [])
     dados.setdefault("diario", [])
+    dados.setdefault("progresso", {"aulas": [], "quiz": {}})
     return dados
 
 
@@ -950,18 +952,19 @@ UNIVERSO_B3 = [
 ]
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def variacoes_b3(tickers):
+def _buscar_variacoes(tickers, sufixo, moeda):
     """Variação do dia de cada ação (último fechamento ou preço atual vs. fechamento anterior)."""
+    col_preco, col_vol = f"Preço ({moeda})", f"Volume ({moeda} mi)"
+
     def uma(t):
         try:
-            h = yf.Ticker(t + ".SA").history(period="5d").dropna(subset=["Close"])
+            h = yf.Ticker(t + sufixo).history(period="5d").dropna(subset=["Close"])
             if len(h) < 2:
                 return None
             u, a = h.iloc[-1], h.iloc[-2]
-            return {"Código": t, "Preço (R$)": float(u["Close"]),
+            return {"Código": t, col_preco: float(u["Close"]),
                     "Variação (%)": (float(u["Close"]) / float(a["Close"]) - 1) * 100,
-                    "Volume (R$ mi)": float(u["Close"]) * float(u["Volume"]) / 1e6,
+                    col_vol: float(u["Close"]) * float(u["Volume"]) / 1e6,
                     "Data": h.index[-1].date()}
         except Exception:
             return None
@@ -973,8 +976,13 @@ def variacoes_b3(tickers):
     return df[df["Data"] == df["Data"].max()].reset_index(drop=True)  # tira papéis sem negócio hoje
 
 
-def ranking_altas_baixas(df, vol_min, n=20):
-    d = df[df["Volume (R$ mi)"] >= vol_min].drop(columns=["Data"])
+@st.cache_data(ttl=300, show_spinner=False)
+def variacoes_b3(tickers):
+    return _buscar_variacoes(tickers, ".SA", "R$")
+
+
+def ranking_altas_baixas(df, vol_min, n=20, col_vol="Volume (R$ mi)"):
+    d = df[df[col_vol] >= vol_min].drop(columns=["Data"])
     altas = d.sort_values("Variação (%)", ascending=False).head(n).reset_index(drop=True)
     baixas = d.sort_values("Variação (%)", ascending=True).head(n).reset_index(drop=True)
     for t in (altas, baixas):
@@ -1012,6 +1020,64 @@ def render_b3_hoje(dados):
     st.markdown("#### 📉 20 maiores baixas do dia")
     st.dataframe(baixas, column_config=CONFIG_B3, use_container_width=True)
     st.caption("O universo é uma lista fixa de ações líquidas, não toda a bolsa. Para analisar um "
+               "papel, busque o código na barra lateral. Não é recomendação de compra ou venda.")
+
+
+# ------------------------------------------------- maiores altas e baixas (EUA)
+# Universo: ações americanas líquidas (grandes empresas e algumas de médio porte mais negociadas).
+# Edite à vontade; códigos que não existirem mais são ignorados.
+UNIVERSO_EUA = [
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "GOOG", "META", "TSLA", "AVGO", "BRK-B", "JPM", "V",
+    "MA", "UNH", "XOM", "LLY", "JNJ", "WMT", "PG", "HD", "COST", "ORCL", "NFLX", "BAC", "CVX",
+    "ABBV", "KO", "PEP", "MRK", "AMD", "ADBE", "CRM", "TMO", "ACN", "MCD", "CSCO", "LIN", "ABT",
+    "WFC", "DIS", "DHR", "INTU", "TXN", "QCOM", "IBM", "GE", "CAT", "VZ", "AMGN", "NOW", "ISRG",
+    "PFE", "AXP", "SPGI", "NEE", "UBER", "RTX", "HON", "LOW", "UNP", "BKNG", "GS", "PGR", "T",
+    "MS", "BLK", "ELV", "TJX", "SYK", "LMT", "VRTX", "SCHW", "C", "MDT", "ADP", "PANW", "CB",
+    "DE", "REGN", "MU", "BA", "PLD", "ADI", "MMC", "CI", "BMY", "SBUX", "GILD", "LRCX", "KLAC",
+    "AMT", "SO", "MO", "DUK", "ZTS", "BX", "CMG", "ANET", "SNPS", "CDNS", "NKE", "PYPL", "INTC",
+    "OXY", "SLB", "COP", "MPC", "USB", "PNC", "TGT", "DG", "KHC", "MDLZ", "CL", "GIS",
+    "PLTR", "COIN", "HOOD", "SOFI", "RIVN", "SNAP", "ROKU", "DKNG", "AFRM", "UPST", "MSTR", "SMCI",
+    "ARM", "RBLX", "DASH", "CRWD", "DDOG", "ZS", "NET", "MDB", "TTD", "ABNB", "SNOW", "SHOP",
+    "PINS", "LYFT", "F", "GM", "AAL", "DAL", "UAL", "CCL", "NCLH", "MRNA", "NIO", "BABA", "PDD",
+]
+
+CONFIG_EUA = {
+    "Preço (US$)": st.column_config.NumberColumn(format="%.2f"),
+    "Variação (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+    "Volume (US$ mi)": st.column_config.NumberColumn(format="%.1f"),
+}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def variacoes_eua(tickers):
+    return _buscar_variacoes(tickers, "", "US$")
+
+
+def render_eua_hoje(dados):
+    topo1, topo2 = st.columns([3, 1])
+    topo1.caption("Variação do dia das ações americanas líquidas. Dados do Yahoo, com possível atraso; "
+                  "atualiza a cada 5 minutos.")
+    if topo2.button("🔄 Atualizar", key="atualizar_eua"):
+        variacoes_eua.clear()
+    vol_min = st.slider("Volume financeiro mínimo do dia (US$ milhões)", 0.0, 500.0, 20.0, 5.0,
+                        key="eua_vol",
+                        help="Filtra papéis com pouca negociação, que costumam distorcer o ranking.")
+    extras = [f["simbolo"] for f in dados["favoritos"]
+              if not f["simbolo"].endswith((".SA", "-USD", "=X", "=F")) and not f["simbolo"].startswith("^")]
+    universo = tuple(dict.fromkeys(UNIVERSO_EUA + extras))
+    with st.spinner("Buscando as cotações dos EUA..."):
+        df = variacoes_eua(universo)
+    if df.empty:
+        st.info("Não consegui carregar as cotações agora. Tente atualizar em instantes.")
+        return
+    altas, baixas, n = ranking_altas_baixas(df, vol_min, col_vol="Volume (US$ mi)")
+    st.caption(f"Pregão de {df['Data'].max():%d/%m/%Y} (horário de Nova York) · {n} ações analisadas "
+               f"(de {len(universo)} da lista). Preços em dólar; não inclui pré e pós-mercado.")
+    st.markdown("#### 📈 20 maiores altas do dia")
+    st.dataframe(altas, column_config=CONFIG_EUA, use_container_width=True)
+    st.markdown("#### 📉 20 maiores baixas do dia")
+    st.dataframe(baixas, column_config=CONFIG_EUA, use_container_width=True)
+    st.caption("O universo é uma lista fixa de ações líquidas, não toda a bolsa americana. Para analisar um "
                "papel, busque o código na barra lateral. Não é recomendação de compra ou venda.")
 
 
@@ -1769,344 +1835,199 @@ def render_comparador(dados, escolha):
     st.caption("Conteúdo educacional. Não é recomendação de investimento.")
 
 
-# --------------------------------------------------------------------- app
-def render_analise(escolha, periodo):
-    ticker = escolha["simbolo"]
-    with st.spinner(f"Buscando dados de {ticker}..."):
-        hist = carregar_historico(ticker)
-        info = carregar_info(ticker)
-        divs = carregar_dividendos(ticker)
+# ------------------------------------------------------------------- aprender
+GLOSSARIO = {
+    "Ação": "Parte do capital de uma empresa. Quem tem ação é sócio e participa dos lucros e dos riscos do negócio.",
+    "Alavancagem": "Operar com valor maior que o capital próprio. Amplifica ganhos, mas também perdas.",
+    "Altcoin": "Qualquer criptomoeda que não seja o Bitcoin.",
+    "ATR": "Average True Range: medida da amplitude média de variação diária do preço. Muito usada para definir a distância do stop.",
+    "Backtest": "Teste de uma regra de investimento em dados históricos. Mostra o passado, não garante o futuro.",
+    "Beta": "Sensibilidade de um ativo ao mercado. Beta acima de 1 tende a oscilar mais que o índice de referência.",
+    "Blockchain": "Registro digital compartilhado e difícil de adulterar, no qual se baseiam muitas criptomoedas.",
+    "Bollinger (bandas)": "Duas faixas ao redor da média móvel, baseadas no desvio padrão. Mostram quanto o preço está esticado em relação à média.",
+    "CDI": "Taxa média dos empréstimos entre bancos. Acompanha de perto a Selic e é referência para a renda fixa.",
+    "Candle": "Representação gráfica de um período, com preço de abertura, máxima, mínima e fechamento.",
+    "Day trade": "Compra e venda do mesmo ativo no mesmo dia.",
+    "Dividendo": "Parte do lucro que a empresa distribui aos acionistas.",
+    "Dividend Yield (DY)": "Dividendos pagos em 12 meses divididos pelo preço atual do ativo.",
+    "Diversificação": "Distribuir o dinheiro entre ativos diferentes para que um problema isolado pese menos no conjunto.",
+    "Drawdown": "Queda do ponto mais alto até o ponto mais baixo seguinte, em um período.",
+    "EBITDA": "Resultado operacional antes de juros, impostos, depreciação e amortização. Aproxima a geração de caixa da operação.",
+    "ETF": "Fundo de índice negociado em bolsa, que busca replicar o desempenho de um índice.",
+    "EV/EBITDA": "Valor da empresa (valor de mercado mais dívida líquida) dividido pelo EBITDA.",
+    "FII": "Fundo de investimento imobiliário, negociado em bolsa. Costuma distribuir rendimentos periodicamente.",
+    "Gap": "Salto de preço entre o fechamento de um pregão e a abertura do seguinte.",
+    "Inflação": "Aumento geral dos preços, que reduz o poder de compra do dinheiro ao longo do tempo.",
+    "IPCA": "Índice oficial de inflação do Brasil, calculado pelo IBGE.",
+    "JCP": "Juros sobre capital próprio: forma de distribuir lucro ao acionista, com tratamento tributário diferente do dividendo. Confira as regras vigentes.",
+    "Liquidez": "Facilidade de comprar ou vender um ativo rapidamente sem mexer muito no preço.",
+    "Long": "Posição comprada: ganha quando o preço sobe.",
+    "MACD": "Indicador que compara duas médias móveis exponenciais para medir a força e a direção do movimento.",
+    "Marcação a mercado": "Atualização diária do preço de um título pelo valor de mercado. Vender antes do vencimento pode render menos ou mais que o esperado.",
+    "Média móvel": "Média dos preços de fechamento dos últimos N períodos, atualizada a cada novo período.",
+    "P/L": "Preço dividido pelo lucro por ação. Indica quantos anos de lucro atual o preço representa.",
+    "P/VP": "Preço dividido pelo valor patrimonial por ação.",
+    "Payout": "Fração do lucro que a empresa distribui como dividendos.",
+    "Pullback": "Recuo do preço dentro de uma tendência maior.",
+    "Renda fixa": "Investimentos cuja regra de remuneração é definida na contratação, como títulos públicos e CDBs. Há risco de crédito, de mercado e de inflação.",
+    "Renda variável": "Investimentos sem remuneração definida de antemão, como ações, FIIs e criptomoedas.",
+    "Rompimento": "Quando o preço ultrapassa um nível de suporte ou resistência relevante.",
+    "ROE": "Retorno sobre o patrimônio líquido: lucro dividido pelo capital dos acionistas.",
+    "RSI": "Índice de força relativa: oscilador de 0 a 100 que mede a velocidade das altas e das baixas recentes.",
+    "Selic": "Taxa básica de juros da economia brasileira, definida pelo Copom do Banco Central.",
+    "Short": "Posição vendida: ganha quando o preço cai. O prejuízo potencial é, em teoria, ilimitado.",
+    "Small caps": "Empresas de menor valor de mercado, em geral com mais volatilidade e menos liquidez.",
+    "Spread": "Diferença entre o melhor preço de compra e o melhor preço de venda de um ativo.",
+    "Stablecoin": "Criptomoeda que busca manter valor estável, por exemplo atrelada ao dólar. Tem riscos de lastro e do emissor.",
+    "Stop": "Nível de preço definido de antemão para encerrar uma operação e limitar a perda.",
+    "Suporte e resistência": "Regiões de preço onde, no passado, a queda ou a alta costumou perder força.",
+    "Tesouro Direto": "Programa do Tesouro Nacional que vende títulos públicos federais a pessoas físicas.",
+    "Valor de mercado": "Preço da ação multiplicado pelo número total de ações da empresa.",
+    "Volatilidade": "Intensidade com que o preço varia. Mais volatilidade significa mais incerteza, para cima e para baixo.",
+    "Volume": "Quantidade (ou valor financeiro) negociada em um período.",
+}
 
-    if hist is None or hist.empty or len(hist) < 30:
-        st.error(f"Não encontrei histórico suficiente para {ticker}.")
-        return
-
-    cripto = escolha["tipo"] == "CRYPTOCURRENCY" or info.get("quoteType") == "CRYPTOCURRENCY"
-    dias_ano = 365 if cripto else 252  # cripto negocia todos os dias
-
-    d = calcular_indicadores(hist)
-    u = d.iloc[-1]
-    ant = d.iloc[-2]
-    preco = float(u["Close"])
-    variacao = (preco / float(ant["Close"]) - 1) * 100
-    moeda = info.get("currency", "USD" if cripto else "BRL")
-    simbolo = {"BRL": "R$", "USD": "US$"}.get(moeda, moeda)
-
-    nome = info.get("longName") or info.get("shortName") or escolha["nome"]
-    st.subheader(f"{nome} ({ticker})")
-    if info.get("sector"):
-        st.caption(f"{info.get('sector')} · {info.get('industry', '')}")
-
-    janela_52 = d.tail(dias_ano)
-    max52, min52 = float(janela_52["High"].max()), float(janela_52["Low"].min())
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Preço", f"{simbolo} {br(preco)}", f"{br(variacao)}%")
-    c2.metric("Máx. 12 meses", f"{simbolo} {br(max52)}",
-              f"{br((preco / max52 - 1) * 100, 1)}% do topo", delta_color="off")
-    c3.metric("Mín. 12 meses", f"{simbolo} {br(min52)}",
-              f"{br((preco / min52 - 1) * 100, 1)}% do fundo", delta_color="off")
-    c4.metric("Valor de mercado", grande(num(info, "marketCap")))
-
-    n_dias = {"6 meses": dias_ano // 2, "1 ano": dias_ano,
-              "2 anos": dias_ano * 2, "5 anos": len(d)}[periodo]
-    visivel = d.tail(n_dias)
-
-    tendencia = analisar_tendencia(d)
-    momento = avaliar_momento(d)
-    fund = None if cripto else avaliar_fundamentos(
-        info, dividend_yield_12m(divs, preco))
-
-    aba_res, aba_sobre, aba_graf, aba_fund, aba_tend, aba_mom = st.tabs(
-        ["Resumo", "Sobre o ativo", "Gráficos", "Fundamentos", "Tendência e médias",
-         "Leitura técnica"])
-
-    with aba_res:
-        a, b, c = st.columns(3)
-        if fund:
-            a.metric("Critérios de referência", f"{fund['aprovados']} de {fund['total']}",
-                     "atendidos", delta_color="off")
-        else:
-            a.metric("Critérios de referência", "Não se aplica", "criptomoeda", delta_color="off")
-        b.metric("Tendência", tendencia["geral"].replace("Tendência de ", "").replace("Tendência ", ""))
-        c.metric("Sinais técnicos", momento["curto"], "alta · baixa · neutro", delta_color="off")
-        st.write(
-            "O resumo cruza três leituras independentes: **valor** (fundamentos), "
-            "**direção** (tendência) e **timing** (sinais técnicos). "
-            "Os indicadores de valor e os sinais técnicos podem apontar em direções diferentes; "
-            "cabe a você pesar cada leitura. "
-            "Veja o detalhe nas outras abas.")
-        if cripto:
-            st.warning("Criptomoedas são muito mais voláteis que ações e não têm balanço "
-                       "nem lucro. A análise aqui é só técnica (preço e volume).")
-        alvo = num(info, "targetMeanPrice")
-        if alvo:
-            st.info(
-                f"Preço-alvo médio dos analistas (Yahoo): {simbolo} {br(alvo)} "
-                f"({br((alvo / preco - 1) * 100, 1)}% vs. preço atual). "
-                "Projeções de analistas costumam errar e variam bastante.")
-
-    with aba_sobre:
-        render_sobre(escolha, info, cripto, simbolo)
-
-    with aba_graf:
-        st.plotly_chart(grafico_principal(visivel), use_container_width=True)
-
-    with aba_fund:
-        if cripto:
-            st.markdown("### Criptomoeda: sem fundamentos tradicionais")
-            st.write("Não há P/L, ROE ou dividendos. Alguns dados de mercado:")
-            x1, x2, x3 = st.columns(3)
-            x1.metric("Valor de mercado", grande(num(info, "marketCap")))
-            x2.metric("Oferta circulante", grande(num(info, "circulatingSupply")))
-            x3.metric("Volume 24h", grande(num(info, "volume24Hr") or float(u["Volume"])))
-        else:
-            st.markdown(f"### {fund['leitura']}")
-            tabela = pd.DataFrame(
-                [{"Indicador": n, "Valor": v, "Referência": r,
-                  "Resultado": "✅" if ok else ("❌" if ok is False else "➖ sem dado")}
-                 for n, v, r, ok in fund["criterios"]])
-            st.dataframe(tabela, hide_index=True, use_container_width=True)
-            st.caption("Limites genéricos de referência. Bancos, seguradoras, FIIs e empresas de "
-                       "crescimento têm padrões próprios; compare sempre com o setor.")
-            x1, x2, x3, x4 = st.columns(4)
-            x1.metric("Lucro por ação (LPA)", br(num(info, "trailingEps")))
-            x2.metric("Valor patrimonial/ação", br(num(info, "bookValue")))
-            x3.metric("Receita (12m)", grande(num(info, "totalRevenue")))
-            x4.metric("Beta", br(num(info, "beta")))
-            if divs is not None and not divs.empty:
-                st.plotly_chart(grafico_dividendos(divs), use_container_width=True)
-
-    with aba_tend:
-        st.markdown(f"### {tendencia['geral']}")
-        for prazo, rot, txt in tendencia["itens"]:
-            st.write(f"**{prazo}:** {rot}. {txt}")
-        st.write(f"**Cruzamento de médias:** {tendencia['cruzamento']}")
-        if tendencia["inclinacao"] is not None:
-            st.write(f"**Inclinação da média de 50 dias (último mês):** "
-                     f"{pct(tendencia['inclinacao'])}")
-        linhas = []
-        for n in (20, 50, 200):
-            m = u[f"SMA{n}"]
-            linhas.append({
-                "Média": f"Simples {n} dias",
-                "Valor": br(m) if pd.notna(m) else "—",
-                "Preço vs. média": pct((preco / m - 1) * 100) if pd.notna(m) else "—"})
-        m_ano = float(janela_52["Close"].mean())
-        linhas.append({"Média": "Último ano", "Valor": br(m_ano),
-                       "Preço vs. média": pct((preco / m_ano - 1) * 100)})
-        st.dataframe(pd.DataFrame(linhas), hide_index=True, use_container_width=True)
-        st.markdown("#### Volume de negociação")
-        v1, v2, v3 = st.columns(3)
-        v1.metric("Último dia", grande(float(u["Volume"])))
-        v2.metric("Média 20 dias", grande(float(u["VOL_MM20"])))
-        v3.metric("Média 1 ano", grande(float(janela_52["Volume"].mean())))
-
-    with aba_mom:
-        st.markdown(f"### Leitura técnica: {momento['leitura']}")
-        st.dataframe(
-            pd.DataFrame([{"Sinal": n, "Direção": "↑ alta" if p > 0 else ("↓ baixa" if p < 0 else "→ neutro"),
-                           "Leitura": t} for n, p, t in momento["sinais"]]),
-            hide_index=True, use_container_width=True)
-        st.markdown("#### Níveis de referência")
-        n1, n2, n3, n4 = st.columns(4)
-        n1.metric("Suporte (60 dias)", f"{simbolo} {br(momento['suporte'])}")
-        n2.metric("Resistência (60 dias)", f"{simbolo} {br(momento['resistencia'])}")
-        n3.metric("Banda inferior Bollinger", f"{simbolo} {br(momento['bb_inf'])}")
-        n4.metric("Média 50 dias", f"{simbolo} {br(momento['sma50'])}")
-        st.write(
-            "Suporte, resistência, bandas e médias são regiões onde o preço já reagiu no passado e "
-            "que analistas usam como referência. Se o preço romper esses níveis, a leitura pode mudar.")
-        st.warning(
-            "Os sinais descrevem o comportamento recente do preço com regras simples e conhecidas. "
-            "Eles não preveem preços e ignoram notícias, resultados e o seu perfil de risco. "
-            "Conteúdo educacional; não é recomendação de investimento.")
-
-
-def render_favoritos(dados):
-    favs = dados["favoritos"]
-    if not favs:
-        st.info("Você ainda não tem favoritos. Escolha um ativo e toque em "
-                "☆ Favoritar na barra lateral.")
-        return
-    linhas = []
-    for f in favs:
-        r = resumo_ativo(f["simbolo"])
-        m = moeda_de(f["simbolo"])
-        linhas.append({
-            "Ativo": f["nome"], "Código": f["simbolo"],
-            "Preço": f"{m} {br(r['preco'])}" if r else "—",
-            "Dia": pct(r["dia"]) if r else "—",
-            "RSI": br(r["rsi"], 0) if r and r["rsi"] is not None else "—",
-            "Tendência": r["tendencia"] if r else "—",
-            "Sinais técnicos": r["momento"] if r else "—"})
-    st.dataframe(pd.DataFrame(linhas), hide_index=True, use_container_width=True)
-    st.caption("Para abrir a análise completa, escolha 'Favoritos' na barra lateral.")
-
-
-def render_alertas(dados, escolha, persistente):
-    st.markdown("### Criar alerta")
-    if not persistente:
-        st.warning("O salvamento ainda não está configurado: seus alertas somem ao recarregar "
-                   "a página e nenhuma notificação é enviada. Veja o LEIA-ME-ALERTAS.md.")
-    else:
-        st.caption("As notificações no celular são enviadas pelo verificador automático "
-                   "(passo 5 do LEIA-ME-ALERTAS.md), a cada ~15 minutos.")
-
-    if escolha is None:
-        st.info("Escolha um ativo na barra lateral para criar um alerta para ele.")
-    else:
-        r = resumo_ativo(escolha["simbolo"])
-        m = moeda_de(escolha["simbolo"])
-        if r is None:
-            st.info("Não consegui o preço atual deste ativo agora.")
-        else:
-            st.write(f"**{escolha['nome']}** ({escolha['simbolo']}) · preço atual "
-                     f"{m} {br(r['preco'])}"
-                     + (f" · RSI {br(r['rsi'], 0)}" if r["rsi"] is not None else ""))
-            tipo = st.selectbox("Avisar quando", list(TIPOS_ALERTA),
-                                format_func=lambda t: TIPOS_ALERTA[t],
-                                key="tipo_alerta")
-            if tipo == "rsi_abaixo":
-                valor = st.number_input("RSI igual ou abaixo de", min_value=1.0,
-                                        max_value=99.0, value=30.0, step=1.0, key="v_rsi")
-            else:
-                padrao = round(r["preco"] * (0.95 if tipo == "preco_abaixo" else 1.05), 2)
-                valor = st.number_input(f"Preço ({m})", min_value=0.0, value=padrao,
-                                        step=0.01, format="%.2f", key=f"v_{tipo}_{escolha['simbolo']}")
-            st.button("Criar alerta", on_click=criar_alerta, args=(escolha, tipo, valor),
-                      type="primary")
-            if tipo == "rsi_abaixo":
-                st.caption("RSI abaixo de 30 costuma indicar queda exagerada (sobrevendido). "
-                           "É um sinal de observação, não garantia de reversão.")
-
-    st.markdown("### Meus alertas")
-    if not dados["alertas"]:
-        st.caption("Nenhum alerta criado.")
-        return
-    for a in dados["alertas"]:
-        m = moeda_de(a["simbolo"])
-        alvo = br(a["valor"], 0) if a["tipo"] == "rsi_abaixo" else f"{m} {br(a['valor'])}"
-        if a.get("disparado_em"):
-            estado = "🔔 disparado em " + a["disparado_em"][:16].replace("T", " ") + " UTC"
-        else:
-            estado = "⏳ ativo"
-        col1, col2, col3 = st.columns([6, 2, 2])
-        col1.write(f"**{a['nome']}** ({a['simbolo']}): {TIPOS_ALERTA[a['tipo']]} {alvo} · {estado}")
-        if a.get("disparado_em"):
-            col2.button("Reativar", key=f"re_{a['id']}", on_click=reativar_alerta, args=(a["id"],))
-        col3.button("Excluir", key=f"ex_{a['id']}", on_click=remover_alerta, args=(a["id"],))
-
-
-def render_noticias(dados, escolha):
-    topo1, topo2 = st.columns([3, 1])
-    topo1.caption("Manchetes de InfoMoney e Google Notícias. Atualiza sozinho a cada 5 minutos.")
-    if topo2.button("🔄 Atualizar"):
-        ler_noticias.clear()
-    opcoes = ["Mercado em geral"]
-    if escolha:
-        opcoes.append("Ativo selecionado")
-    if dados["favoritos"]:
-        opcoes.append("Meus favoritos")
-    foco = st.radio("Mostrar", opcoes, horizontal=True)
-
-    if foco == "Mercado em geral":
-        listas = [ler_noticias("https://www.infomoney.com.br/feed/", "InfoMoney"),
-                  ler_noticias(url_google_noticias("mercado financeiro bolsa B3 dólar"),
-                               "Google Notícias")]
-        mostrar_noticias(juntar_noticias(listas, 25))
-    elif foco == "Ativo selecionado":
-        st.write(f"Notícias sobre **{escolha['nome']}**")
-        lista = ler_noticias(url_google_noticias(consulta_do_ativo(escolha)), "Google Notícias")
-        mostrar_noticias(juntar_noticias([lista], 15))
-    else:
-        for f in dados["favoritos"][:6]:
-            st.markdown(f"#### {f['nome']}")
-            lista = ler_noticias(url_google_noticias(consulta_do_ativo(f)), "Google Notícias")
-            mostrar_noticias(juntar_noticias([lista], 3))
-        if len(dados["favoritos"]) > 6:
-            st.caption("Mostrando os 6 primeiros favoritos.")
-
-
-def main():
-    dados, persistente = ler_dados()
-    barra_cotacoes(dados)
-    st.title("📈 Santinvest")
-    st.caption("Ações, FIIs, ETFs e criptomoedas. Dados do Yahoo Finance. "
-               "Ferramenta de apoio à pesquisa, não é recomendação de compra ou venda.")
-
-    erro = st.session_state.pop("erro_salvar", None)
-    if erro:
-        st.error(erro)
-
-    escolha = None
-    with st.sidebar:
-        st.header("Ativo")
-        modo = "Buscar"
-        if dados["favoritos"]:
-            modo = st.radio("Escolher por", ["Buscar", "Favoritos"], horizontal=True)
-        if modo == "Buscar":
-            texto = st.text_input("Nome ou código", value="Petrobras",
-                                  help="Ex.: Petrobras, Vale, Apple, HGLG11, Bitcoin, Ethereum")
-            resultados = buscar_ativos(texto)
-            if resultados:
-                i = st.selectbox("Escolha o ativo", range(len(resultados)),
-                                 format_func=lambda k: resultados[k]["rotulo"])
-                escolha = resultados[i]
-            else:
-                st.error("Não encontrei esse ativo. Tente outro nome ou o código "
-                         "(ex.: PETR4, BTC-USD).")
-        else:
-            favs = dados["favoritos"]
-            i = st.selectbox("Seus favoritos", range(len(favs)),
-                             format_func=lambda k: f"{favs[k]['nome']} ({favs[k]['simbolo']})")
-            escolha = favs[i]
-        periodo = st.selectbox("Período dos gráficos", ["6 meses", "1 ano", "2 anos", "5 anos"], index=1)
-        if escolha:
-            ja = any(f["simbolo"] == escolha["simbolo"] for f in dados["favoritos"])
-            st.button("★ Remover dos favoritos" if ja else "☆ Favoritar",
-                      on_click=alternar_favorito, args=(escolha,), use_container_width=True)
-        st.caption("💾 Favoritos e alertas salvos." if persistente else
-                   "⚠️ Salvamento não configurado: favoritos e alertas somem ao recarregar.")
-
-    for a, r in alertas_atingidos(dados):
-        m = moeda_de(a["simbolo"])
-        st.warning(f"🔔 Alerta atingido: {a['nome']} ({a['simbolo']}) está em "
-                   f"{m} {br(r['preco'])} · {TIPOS_ALERTA[a['tipo']]} "
-                   + (br(a['valor'], 0) if a['tipo'] == 'rsi_abaixo' else f"{m} {br(a['valor'])}"))
-
-    st.session_state["_escolha"] = escolha
-    t_an, t_fav, t_cmp, t_ca, t_rk, t_b3, t_mc, t_al, t_nt, t_cr = st.tabs(
-        ["Análise", "⭐ Favoritos", "⚖️ Comparador", "💼 Carteira", "🛡️ Risco", "📊 B3 hoje",
-         "🪙 Mercado cripto", "🔔 Alertas", "📰 Notícias", "📰 Notícias cripto"])
-    with t_an:
-        if escolha:
-            render_analise(escolha, periodo)
-        else:
-            st.info("Digite o nome ou código de um ativo na barra lateral.")
-    with t_fav:
-        render_favoritos(dados)
-    with t_cmp:
-        render_comparador(dados, escolha)
-    with t_ca:
-        render_carteira(dados, escolha)
-    with t_rk:
-        render_risco(dados, escolha)
-    with t_b3:
-        render_b3_hoje(dados)
-    with t_mc:
-        render_mercado_cripto()
-    with t_al:
-        render_alertas(dados, escolha, persistente)
-    with t_nt:
-        render_noticias(dados, escolha)
-    with t_cr:
-        render_cripto()
-    st.divider()
-    st.caption("Conteúdo educacional e informativo. Não constitui recomendação de investimento, "
-               "oferta ou consultoria. Cada investidor é responsável por suas decisões. "
-               "Dados de fontes públicas, que podem conter atrasos ou erros.")
-
-
-if __name__ == "__main__":
-    main()
+TRILHAS = [
+    {"id": "base", "titulo": "Primeiros passos no mercado", "nivel": "Iniciante", "aulas": [
+        {"id": "base1", "titulo": "Os principais tipos de investimento",
+         "texto": "Na **renda fixa**, você empresta dinheiro e a regra de remuneração é definida antes. Na **renda variável**, "
+                  "o retorno não é conhecido de antemão: **ações** são partes de empresas, **FIIs** são fundos que investem em "
+                  "imóveis ou papéis ligados a eles, e **ETFs** são fundos que replicam um índice e são negociados em bolsa. "
+                  "**Criptomoedas** são ativos digitais com volatilidade muito alta e regulação ainda em evolução. "
+                  "Cada categoria tem riscos próprios.",
+         "ferramenta": "Aba Análise → Sobre o ativo"},
+        {"id": "base2", "titulo": "Risco, retorno e prazo",
+         "texto": "Em geral, a possibilidade de retornos maiores vem junto com a possibilidade de perdas maiores. Retorno passado "
+                  "não garante retorno futuro. Três perguntas ajudam a entender um investimento: quanto o preço pode oscilar "
+                  "(volatilidade), quão rápido dá para vender (liquidez) e por quanto tempo o dinheiro pode ficar investido "
+                  "(prazo). Objetivos e prazos pessoais mudam o que faz sentido para cada pessoa.",
+         "ferramenta": "Aba Análise → Gráficos e Tendência e médias"},
+        {"id": "base3", "titulo": "Diversificação e concentração",
+         "texto": "Concentrar o dinheiro em poucos ativos faz com que um problema isolado pese muito no resultado. "
+                  "Diversificar é distribuir entre ativos diferentes (setores, tipos de investimento, países) para reduzir "
+                  "esse efeito. Ela não elimina o risco: em crises, muitos ativos caem juntos. Olhar o peso de cada ativo na "
+                  "carteira é o primeiro passo.",
+         "ferramenta": "Aba Carteira → Distribuição"},
+        {"id": "base4", "titulo": "Custos, inflação e impostos",
+         "texto": "Corretagem, taxas de custódia, taxas de administração de fundos e impostos reduzem o retorno líquido. "
+                  "A inflação reduz o poder de compra: o que importa é o ganho acima dela (juro real). Compare sempre o retorno "
+                  "com uma referência, como o CDI ou a inflação. As regras de tributação mudam com o tempo, então confira as "
+                  "vigentes antes de decidir.",
+         "ferramenta": "Aba Carteira → comparação com Ibovespa e CDI"},
+    ], "quiz": [
+        {"p": "O que significa dizer que o retorno de um investimento de renda variável não é garantido?",
+         "o": ["O valor futuro não é conhecido de antemão e pode ser menor que o investido",
+               "Ele sempre rende menos que a renda fixa", "A corretora define o resultado no fim do mês"],
+         "c": 0, "e": "Na renda variável não há remuneração definida na contratação."},
+        {"p": "O que a diversificação faz?",
+         "o": ["Elimina o risco de perda", "Reduz o peso de um problema isolado no conjunto da carteira",
+               "Garante retorno maior"],
+         "c": 1, "e": "Ela reduz o efeito de eventos isolados, mas não elimina o risco, principalmente em crises."},
+        {"p": "Por que comparar o retorno com o CDI ou com a inflação?",
+         "o": ["Porque eles definem o preço das ações", "Para saber se o ganho superou uma referência e o poder de compra",
+               "Porque são obrigatórios na declaração do imposto"],
+         "c": 1, "e": "Sem referência, não dá para saber se o retorno compensou o risco e a inflação."},
+    ]},
+    {"id": "fund", "titulo": "Analisando uma ação: fundamentos", "nivel": "Intermediário", "aulas": [
+        {"id": "fund1", "titulo": "Lendo uma empresa: receita, lucro e dívida",
+         "texto": "A **receita** é o que a empresa vende. Descontados custos e despesas, sobra o **lucro**. O **balanço** mostra o "
+                  "que a empresa tem (ativos), o que deve (passivos) e o que sobra para os acionistas (**patrimônio líquido**). "
+                  "Observe a evolução ao longo de vários períodos, não só o último número. Lucros únicos (venda de um ativo, "
+                  "por exemplo) podem distorcer o resultado de um ano.",
+         "ferramenta": "Aba Análise → Fundamentos"},
+        {"id": "fund2", "titulo": "Múltiplos: P/L, P/VP e EV/EBITDA",
+         "texto": "Múltiplos relacionam o preço a algum resultado da empresa. O **P/L** compara preço e lucro, o **P/VP** compara "
+                  "preço e patrimônio, e o **EV/EBITDA** compara o valor da empresa, incluindo dívida, com a geração operacional. "
+                  "Valores baixos não significam, sozinhos, que algo é barato: setores diferentes têm padrões diferentes, "
+                  "empresas cíclicas distorcem o P/L, e bancos exigem outros indicadores. Compare dentro do mesmo setor.",
+         "ferramenta": "Aba Comparador"},
+        {"id": "fund3", "titulo": "Rentabilidade e endividamento: ROE, margem e dívida",
+         "texto": "O **ROE** mede quanto lucro a empresa gera sobre o capital dos acionistas. A **margem líquida** mostra quanto "
+                  "sobra de lucro a cada R$ 100 de receita. A **dívida sobre patrimônio** indica o grau de endividamento. "
+                  "Um ROE alto obtido com muita dívida carrega mais risco. Vale olhar esses números em conjunto e ao longo do tempo.",
+         "ferramenta": "Aba Análise → Fundamentos"},
+        {"id": "fund4", "titulo": "Dividendos: yield e payout",
+         "texto": "O **dividend yield** relaciona os dividendos dos últimos 12 meses ao preço. O **payout** mostra que parte do "
+                  "lucro foi distribuída. Um yield muito alto pode refletir queda forte do preço ou um pagamento que a empresa "
+                  "não consegue sustentar. Dividendos não são garantidos e podem ser reduzidos ou suspensos.",
+         "ferramenta": "Aba Análise → Fundamentos (histórico de dividendos)"},
+    ], "quiz": [
+        {"p": "Por que comparar o P/L de empresas de setores muito diferentes pode enganar?",
+         "o": ["Porque cada setor tem padrões próprios de lucro, investimento e dívida",
+               "Porque o P/L só existe para bancos", "Porque o P/L não muda entre setores"],
+         "c": 0, "e": "Os múltiplos fazem mais sentido quando comparados dentro do mesmo setor."},
+        {"p": "O que um ROE alto, obtido com muita dívida, indica?",
+         "o": ["Risco nenhum, porque o lucro é alto", "Que o retorno veio com mais risco financeiro",
+               "Que a empresa não paga dividendos"],
+         "c": 1, "e": "A dívida pode ampliar o retorno sobre o patrimônio, mas também aumenta o risco."},
+        {"p": "Um dividend yield muito alto pode sinalizar:",
+         "o": ["Sempre uma oportunidade", "Possível queda forte do preço ou dividendo difícil de sustentar",
+               "Que a empresa não tem lucro nenhum"],
+         "c": 1, "e": "O yield sobe quando o preço cai, e o pagamento pode não se repetir."},
+    ]},
+    {"id": "tec", "titulo": "Análise técnica básica", "nivel": "Intermediário", "aulas": [
+        {"id": "tec1", "titulo": "O que a análise técnica é, e o que não é",
+         "texto": "A análise técnica estuda o comportamento do preço e do volume no passado para descrever o presente. Ela não "
+                  "prevê o futuro e envolve interpretação, o que abre espaço para vieses, como ver apenas o que confirma uma "
+                  "opinião prévia. Muitos investidores a usam como contexto, junto com outras análises. Sinais isolados "
+                  "costumam falhar.",
+         "ferramenta": "Aba Análise → Leitura técnica"},
+        {"id": "tec2", "titulo": "Tendência e médias móveis",
+         "texto": "A **média móvel** suaviza o preço. Preço acima de uma média longa, como a de 200 dias, costuma ser lido como "
+                  "tendência de alta, e abaixo como tendência de baixa. Médias atrasam em relação ao preço, porque são calculadas "
+                  "com dados passados, e geram muitos sinais falsos quando o mercado anda de lado.",
+         "ferramenta": "Aba Análise → Tendência e médias"},
+        {"id": "tec3", "titulo": "RSI, MACD e Bollinger",
+         "texto": "O **RSI** mede a força das altas e baixas recentes; leituras acima de 70 ou abaixo de 30 são tratadas como "
+                  "extremos, mas em tendências fortes o RSI pode permanecer extremo por muito tempo. O **MACD** compara médias "
+                  "exponenciais para medir impulso. As **bandas de Bollinger** mostram quão esticado o preço está em relação à "
+                  "média. São descrições do passado recente, não previsões.",
+         "ferramenta": "Aba Análise → Gráficos"},
+        {"id": "tec4", "titulo": "Suporte, resistência e volume",
+         "texto": "**Suporte** e **resistência** são regiões onde o preço já reagiu antes. **Volume** alto em um movimento indica "
+                  "mais participação do mercado. Esses níveis não são barreiras garantidas: são referências que podem ser "
+                  "rompidas. Por isso, muitos investidores definem de antemão onde a leitura deixa de valer.",
+         "ferramenta": "Aba Análise → Leitura técnica (níveis de referência)"},
+    ], "quiz": [
+        {"p": "A análise técnica serve para:",
+         "o": ["Descrever o comportamento do preço, sem prever o futuro", "Garantir a direção do preço",
+               "Substituir toda a análise de empresas"],
+         "c": 0, "e": "Ela descreve o que o preço fez; qualquer uso para o futuro é interpretação."},
+        {"p": "Por que as médias móveis dão muitos sinais falsos quando o mercado anda de lado?",
+         "o": ["Porque são calculadas com dados passados e o preço cruza a média várias vezes",
+               "Porque só funcionam para cripto", "Porque o volume desaparece"],
+         "c": 0, "e": "Sem tendência, o preço cruza a média repetidamente, e cada cruzamento vira um sinal."},
+        {"p": "Um RSI acima de 70 significa necessariamente que o preço vai cair?",
+         "o": ["Sim, sempre", "Não: em tendências fortes ele pode ficar alto por muito tempo", "Sim, em até 3 dias"],
+         "c": 1, "e": "O RSI mede força recente; não determina o que vem depois."},
+    ]},
+    {"id": "cripto", "titulo": "Criptomoedas: fundamentos e riscos", "nivel": "Iniciante", "aulas": [
+        {"id": "cr1", "titulo": "O que são e como funcionam",
+         "texto": "Criptomoedas são ativos digitais registrados em uma **blockchain**, um livro-razão compartilhado e difícil de "
+                  "adulterar. O **Bitcoin** foi a primeira. Qualquer outra moeda é chamada de **altcoin**. As **stablecoins** "
+                  "buscam manter valor estável, por exemplo atrelado ao dólar, e têm riscos ligados ao lastro e ao emissor.",
+         "ferramenta": "Aba Mercado cripto"},
+        {"id": "cr2", "titulo": "Volatilidade e riscos",
+         "texto": "Criptomoedas costumam oscilar muito mais que ações. Há riscos de custódia (perder o acesso às chaves), de "
+                  "golpes, de falhas de plataformas, de liquidez em moedas pequenas e de mudanças regulatórias. O mercado "
+                  "negocia 24 horas por dia, todos os dias. Entender o quanto uma queda grande pesaria no seu patrimônio "
+                  "faz parte da análise.",
+         "ferramenta": "Aba Comparador → critérios de volatilidade e maior queda"},
+        {"id": "cr3", "titulo": "Indicadores do mercado cripto",
+         "texto": "O **valor de mercado** (preço vezes oferta circulante) compara o tamanho das moedas. A **dominância do "
+                  "Bitcoin** mostra que fatia do valor total ele representa. O **volume** indica o quanto foi negociado. "
+                  "O índice de **medo e ganância** resume o sentimento do mercado: descreve o humor atual, não prevê preços.",
+         "ferramenta": "Aba Mercado cripto"},
+    ], "quiz": [
+        {"p": "Qual destes é um risco específico de quem guarda criptomoedas por conta própria?",
+         "o": ["Perder o acesso às chaves de acesso", "Receber dividendos demais", "O mercado fechar às 17h"],
+         "c": 0, "e": "Quem perde as chaves pode perder o acesso aos ativos, sem como recuperar."},
+        {"p": "O índice de medo e ganância:",
+         "o": ["Prevê o preço do próximo mês", "Resume o sentimento atual do mercado", "Garante quando comprar ou vender"],
+         "c": 1, "e": "É um indicador de sentimento, não de previsão."},
+        {"p": "O que é uma stablecoin?",
+         "o": ["Uma criptomoeda que busca manter valor estável, sem garantia de que consiga",
+               "Uma ação de empresa de tecnologia", "Um título público"],
+         "c": 0, "e": "Ela busca estabilidade, mas depende do lastro e do emissor."},
+    ]},
+    {
